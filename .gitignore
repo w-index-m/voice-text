@@ -1,0 +1,13 @@
+# 秘密情報は絶対にコミットしない
+.streamlit/secrets.toml
+*.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
