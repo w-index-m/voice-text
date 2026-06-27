@@ -1,3 +1,4 @@
 streamlit>=1.30
 openai>=1.30
 requests>=2.31
+streamlit-mic-recorder>=0.0.8

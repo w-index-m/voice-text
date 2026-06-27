@@ -23,6 +23,7 @@ import time
 
 import requests
 import streamlit as st
+from streamlit_mic_recorder import mic_recorder
 from openai import OpenAI
 
 AAI_BASE = "https://api.assemblyai.com/v2"
@@ -235,18 +236,47 @@ ss = st.session_state
 ss.setdefault("aai_data", None)
 ss.setdefault("speakers", [])
 ss.setdefault("audio_name", "")
+ss.setdefault("recorded_audio", None)
 
-uploaded = st.file_uploader(
-    "音声ファイルをアップロード",
-    type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"],
-    help="アップロード・分割・話者分離は AssemblyAI 側で処理します。",
-)
+tab_rec, tab_up = st.tabs(["🎤 マイク録音", "📁 ファイルアップロード"])
+
+file_bytes = None
+audio_name = ""
+
+with tab_rec:
+    st.caption("「録音開始」を押してマイクに話しかけ、終わったら「録音停止」を押す")
+    recorded = mic_recorder(
+        start_prompt="🎤 録音開始",
+        stop_prompt="⏹ 録音停止",
+        just_once=False,
+        use_container_width=True,
+        key="mic_recorder",
+    )
+    if recorded:
+        ss.recorded_audio = recorded["bytes"]
+    if ss.recorded_audio:
+        file_bytes = ss.recorded_audio
+        audio_name = "録音音声.wav"
+        st.audio(ss.recorded_audio, format="audio/wav")
+        st.success(f"録音完了 / {len(ss.recorded_audio)/1024:.1f} KB")
+        if st.button("録音をクリア", key="clear_rec"):
+            ss.recorded_audio = None
+            st.rerun()
+
+with tab_up:
+    uploaded = st.file_uploader(
+        "音声ファイルをアップロード",
+        type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"],
+        help="アップロード・分割・話者分離は AssemblyAI 側で処理します。",
+    )
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        audio_name = uploaded.name
+        st.info(f"ファイル: {uploaded.name} / {len(file_bytes)/1024/1024:.1f} MB")
+        st.audio(file_bytes)
 
 # ステップ1: 文字起こし
-if uploaded is not None:
-    file_bytes = uploaded.getvalue()
-    st.info(f"ファイル: {uploaded.name} / {len(file_bytes)/1024/1024:.1f} MB")
-    st.audio(file_bytes)
+if file_bytes is not None:
 
     if st.button("① 文字起こし（話者分離）", type="primary"):
         aai_key = get_aai_key()
@@ -263,13 +293,21 @@ if uploaded is not None:
             st.stop()
         ss.aai_data = data
         ss.speakers = sorted({u["speaker"] for u in data.get("utterances", [])})
-        ss.audio_name = uploaded.name
+        ss.audio_name = audio_name
         st.success(f"完了。検出話者: {len(ss.speakers)}名")
 
 # ステップ2: リネーム & 議事録
 if ss.aai_data is not None:
     st.divider()
     st.subheader("② 話者の名前を割り当て（任意）")
+    raw_text = build_diarized_text(ss.aai_data)
+    base_name = os.path.splitext(ss.audio_name)[0]
+    st.download_button(
+        "📄 文字起こし全文を .txt で保存",
+        raw_text.encode("utf-8"),
+        file_name=f"{base_name}_文字起こし.txt",
+        mime="text/plain",
+    )
 
     if attendees.strip():
         cand = [a.strip() for a in attendees.replace(",", "\n").splitlines() if a.strip()]
