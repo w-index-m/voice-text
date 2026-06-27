@@ -1,17 +1,18 @@
 """
-音声議事録アプリ (Streamlit) - 話者分離 + 出席者リネーム + 粒度切替 + ToDo CSV
-- 音声アップロード -> AssemblyAI で文字起こし＋話者分離
-- 検出話者を実名にリネーム
-- 要約の粒度（3行 / 詳細 / 決定事項のみ）を選択
-- GPT で議事録生成 + ToDo を JSON で抽出して CSV ダウンロード
+音声議事録アプリ (Streamlit)
+- AssemblyAI で文字起こし＋話者分離
+- LLM は Gemini（無料・恒常）/ AssemblyAI LLM Gateway(Claude) を選択可能
+- 話者リネーム / 粒度切替 / ToDo CSV出力
 
-セットアップ:
-  pip install streamlit openai requests
-  .streamlit/secrets.toml:
-    OPENAI_API_KEY = "sk-..."
-    ASSEMBLYAI_API_KEY = "..."
-起動:
-  streamlit run app.py
+キー構成:
+  Gemini使用時  → ASSEMBLYAI_API_KEY + GEMINI_API_KEY
+  Claude使用時  → ASSEMBLYAI_API_KEY のみ（LLM Gatewayで消費）
+
+.streamlit/secrets.toml:
+  ASSEMBLYAI_API_KEY = "..."
+  GEMINI_API_KEY = "..."  # Gemini使用時のみ必要
+
+起動: streamlit run app.py
 """
 
 import io
@@ -26,16 +27,22 @@ from openai import OpenAI
 
 AAI_BASE = "https://api.assemblyai.com/v2"
 
+# LLMバックエンド設定
+LLM_BACKENDS = {
+    "Gemini 2.5 Flash（無料・推奨）": {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.5-flash",
+        "key_secret": "GEMINI_API_KEY",
+    },
+    "Claude Sonnet（AssemblyAIクレジット消費）": {
+        "base_url": "https://llm-gateway.assemblyai.com/v1",
+        "model": "claude-sonnet-4-5-20250929",
+        "key_secret": "ASSEMBLYAI_API_KEY",
+    },
+}
 
-# ----- キー / クライアント -----
-def get_openai() -> OpenAI:
-    key = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-    if not key:
-        st.error("OPENAI_API_KEY が未設定です。secrets.toml を確認してください。")
-        st.stop()
-    return OpenAI(api_key=key)
 
-
+# ----- キー -----
 def get_aai_key() -> str:
     key = st.secrets.get("ASSEMBLYAI_API_KEY") or os.environ.get("ASSEMBLYAI_API_KEY")
     if not key:
@@ -44,7 +51,20 @@ def get_aai_key() -> str:
     return key
 
 
-# ----- AssemblyAI -----
+def get_llm_client(backend_name: str) -> OpenAI:
+    cfg = LLM_BACKENDS[backend_name]
+    key = st.secrets.get(cfg["key_secret"]) or os.environ.get(cfg["key_secret"])
+    if not key:
+        st.error(f"{cfg['key_secret']} が未設定です。secrets.toml を確認してください。")
+        st.stop()
+    return OpenAI(api_key=key, base_url=cfg["base_url"])
+
+
+def get_llm_model(backend_name: str) -> str:
+    return LLM_BACKENDS[backend_name]["model"]
+
+
+# ----- AssemblyAI: 文字起こし -----
 def aai_upload(api_key: str, file_bytes: bytes) -> str:
     headers = {"authorization": api_key}
     resp = requests.post(f"{AAI_BASE}/upload", headers=headers, data=file_bytes)
@@ -80,20 +100,19 @@ def aai_transcribe(api_key: str, audio_url: str, language: str) -> dict:
 
 
 def build_diarized_text(data: dict, name_map: dict | None = None) -> str:
-    """utterances を「話者名: 発言」形式に。name_map で実名へ置換可能。"""
     utterances = data.get("utterances")
     if not utterances:
         return data.get("text", "")
     name_map = name_map or {}
     lines = []
     for u in utterances:
-        label = u["speaker"]  # 'A' / 'B' ...
+        label = u["speaker"]
         display = name_map.get(label) or f"話者{label}"
         lines.append(f"{display}: {u['text']}")
     return "\n".join(lines)
 
 
-# ----- GPT: 議事録 -----
+# ----- LLM: 議事録 -----
 GRANULARITY_SPEC = {
     "3行サマリ": "要点を3行程度で簡潔にまとめる。詳細は省く。",
     "詳細議事録": "発言サマリ・議論の要点・決定事項・ToDoまで網羅した詳細な議事録。",
@@ -101,8 +120,9 @@ GRANULARITY_SPEC = {
 }
 
 
-def summarize(client: OpenAI, diarized_text: str, meeting_title: str,
-              meeting_date: str, attendees: str, granularity: str) -> str:
+def summarize(client: OpenAI, model: str, diarized_text: str,
+              meeting_title: str, meeting_date: str,
+              attendees: str, granularity: str) -> str:
     system = (
         "あなたは優秀な議事録作成者です。話者ラベル付きの文字起こしを読み、"
         "日本語で構造化された議事録を Markdown で作成してください。"
@@ -132,33 +152,33 @@ def summarize(client: OpenAI, diarized_text: str, meeting_title: str,
 {diarized_text}
 """
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
+        max_tokens=4000,
         temperature=0.3,
     )
     return resp.choices[0].message.content
 
 
-def extract_todos(client: OpenAI, diarized_text: str) -> list[dict]:
-    """ToDoを構造化JSONで抽出。"""
+def extract_todos(client: OpenAI, model: str, diarized_text: str) -> list[dict]:
     system = "会議の文字起こしからToDo（アクションアイテム）を抽出するアシスタント。"
     user = f"""以下の文字起こしから ToDo を抽出し、JSON配列のみを返してください。
 前後の説明やMarkdownのコードフェンスは付けないでください。
-各要素は以下のキー: task(タスク内容), owner(担当者/不明なら空文字), due(期限/不明なら空文字)
-
+各要素のキー: task(タスク内容), owner(担当者/不明なら空文字), due(期限/不明なら空文字)
 ToDoが無ければ [] を返してください。
 
 ---
 {diarized_text}
 """
     resp = client.chat.completions.create(
-        model="gpt-4o",
+        model=model,
         messages=[{"role": "system", "content": system},
                   {"role": "user", "content": user}],
+        max_tokens=2000,
         temperature=0.0,
     )
-    text = resp.choices[0].message.content.strip()
+    text = (resp.choices[0].message.content or "").strip()
     text = text.replace("```json", "").replace("```", "").strip()
     try:
         todos = json.loads(text)
@@ -173,7 +193,6 @@ def todos_to_csv(todos: list[dict]) -> bytes:
     writer.writerow(["タスク", "担当者", "期限"])
     for t in todos:
         writer.writerow([t.get("task", ""), t.get("owner", ""), t.get("due", "")])
-    # Excel(Windows)での文字化け回避に BOM 付き UTF-8
     return ("\ufeff" + buf.getvalue()).encode("utf-8")
 
 
@@ -183,9 +202,17 @@ st.title("🎙️ 音声議事録メーカー")
 st.caption("話者分離 / 出席者リネーム / 粒度切替 / ToDo CSV出力")
 
 with st.sidebar:
+    st.header("LLM設定")
+    backend_name = st.radio(
+        "議事録整形エンジン",
+        list(LLM_BACKENDS.keys()),
+        help="Geminiは無料枠あり（Google AI StudioでAPIキー発行）。Claudeはコスト有。",
+    )
+
+    st.divider()
     st.header("会議情報")
     meeting_title = st.text_input("会議名（任意）")
-    meeting_date = st.text_input("日時（任意・例: 2026-06-26 14:00）")
+    meeting_date = st.text_input("日時（任意・例: 2026-06-27 14:00）")
     attendees = st.text_area("出席者（任意・改行 or カンマ区切り）",
                              help="事前に名前を入れておくと話者の実名推定に使われます。")
     language = st.selectbox("音声の言語",
@@ -194,10 +221,19 @@ with st.sidebar:
     granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
     show_transcript = st.checkbox("話者分離テキスト全文も表示", value=True)
 
-# セッション状態の初期化
+# Gemini選択時のキー案内
+if "Gemini" in backend_name:
+    gemini_key = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        st.warning(
+            "Geminiを使うには GEMINI_API_KEY が必要です。"
+            " [Google AI Studio](https://aistudio.google.com/apikey) で無料発行できます。"
+            " secrets.toml に追加してください。"
+        )
+
 ss = st.session_state
-ss.setdefault("aai_data", None)       # AssemblyAI の結果
-ss.setdefault("speakers", [])         # 検出話者ラベル ['A','B',...]
+ss.setdefault("aai_data", None)
+ss.setdefault("speakers", [])
 ss.setdefault("audio_name", "")
 
 uploaded = st.file_uploader(
@@ -230,12 +266,11 @@ if uploaded is not None:
         ss.audio_name = uploaded.name
         st.success(f"完了。検出話者: {len(ss.speakers)}名")
 
-# ステップ2: 話者リネーム & 議事録
+# ステップ2: リネーム & 議事録
 if ss.aai_data is not None:
     st.divider()
     st.subheader("② 話者の名前を割り当て（任意）")
 
-    # 出席者の候補をサジェストとして表示
     if attendees.strip():
         cand = [a.strip() for a in attendees.replace(",", "\n").splitlines() if a.strip()]
         if cand:
@@ -255,16 +290,19 @@ if ss.aai_data is not None:
             st.text_area("transcript", diarized, height=300)
 
     if st.button("③ 議事録を作成", type="primary"):
-        client = get_openai()
-        with st.spinner("議事録を整形中..."):
+        client = get_llm_client(backend_name)
+        model = get_llm_model(backend_name)
+
+        with st.spinner(f"議事録を整形中...（{backend_name}）"):
             try:
-                minutes = summarize(client, diarized, meeting_title,
+                minutes = summarize(client, model, diarized, meeting_title,
                                     meeting_date, attendees, granularity)
             except Exception as e:
                 st.error(f"議事録整形失敗: {e}")
                 st.stop()
+
         with st.spinner("ToDoを抽出中..."):
-            todos = extract_todos(client, diarized)
+            todos = extract_todos(client, model, diarized)
 
         st.subheader("📝 議事録")
         st.markdown(minutes)
