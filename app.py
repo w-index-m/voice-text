@@ -54,6 +54,11 @@ LLM_BACKENDS = {
         "model": "claude-sonnet-4-5-20250929",
         "key_secret": "ASSEMBLYAI_API_KEY",
     },
+    "Claude Opus（高精度・コスト高）": {
+        "base_url": "https://llm-gateway.assemblyai.com/v1",
+        "model": "claude-opus-4-1-20250805",
+        "key_secret": "ASSEMBLYAI_API_KEY",
+    },
 }
 
 # ----- カスタムCSS（ダークモード対応） -----
@@ -285,16 +290,21 @@ def auto_map_speakers(client: OpenAI, model: str,
     if not cands:
         return {}
 
-    system = "会議の文字起こしサンプルと出席者リストから、話者ラベルと実名を対応付けるアシスタント。"
+    system = (
+        "会議の文字起こしと出席者リストから、各話者の実名を推定するアシスタント。"
+        "発言内容・話し方・呼びかけ（「○○さん」等）・議題の主導者かどうかといった手がかりから、"
+        "話者の役職や立場も考慮して、最も確からしい出席者名を割り当てます。"
+    )
     user = f"""以下の情報を元に、各話者ラベルに最も対応しそうな出席者名を推定してください。
+発言内容から推測できる役職・立場（司会/上長/担当者など）や、他者からの呼びかけも手がかりにしてください。
 推定が難しい場合は空文字にしてください。
 JSON オブジェクトのみ返してください（説明不要）。
 
 話者ラベル: {speakers}
 出席者候補: {cands}
 
-文字起こしサンプル（最初の300文字）:
-{sample_text[:300]}
+文字起こしサンプル（最初の1500文字）:
+{sample_text[:1500]}
 
 出力例: {{"A": "田中太郎", "B": "鈴木花子", "C": ""}}
 """
@@ -359,6 +369,36 @@ def summarize(client: OpenAI, model: str, diarized_text: str,
                   {"role": "user", "content": user}],
         max_tokens=4000,
         temperature=0.3,
+    )
+    return resp.choices[0].message.content
+
+
+def analyze_sentiment(client: OpenAI, model: str, diarized_text: str) -> str:
+    system = (
+        "あなたは会議のファシリテーション分析の専門家です。"
+        "話者ラベル付きの文字起こしを読み、会議の温度感・対立・合意・熱量を分析し、"
+        "日本語の Markdown レポートを作成してください。"
+    )
+    user = f"""以下の会議の文字起こしを分析し、温度感レポートを Markdown で作成してください。
+
+# 出力フォーマット
+- ## 全体の雰囲気（一言で / 例: 建設的・緊張気味・和やか など）
+- ## 熱量の推移（議論が盛り上がった/停滞した場面）
+- ## 対立・意見の相違（あれば、論点と双方の立場）
+- ## 合意・前向きな点（合意に至った点、ポジティブな発言）
+- ## 発言バランス（話者ごとの発言量・積極性の偏り）
+- ## ファシリテーションの観点での気づき（改善提案があれば）
+
+---
+文字起こし（話者分離済み）:
+{diarized_text}
+"""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        max_tokens=2500,
+        temperature=0.4,
     )
     return resp.choices[0].message.content
 
@@ -484,6 +524,7 @@ ss.setdefault("audio_name", "")
 ss.setdefault("recorded_audio", None)
 ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
+ss.setdefault("sentiment", None)
 
 tab_rec, tab_up = st.tabs(["🎤 マイク録音", "📁 ファイルアップロード"])
 
@@ -627,6 +668,7 @@ if ss.aai_data is not None:
 
         ss.minutes_edited = minutes
         ss["todos"] = todos
+        ss["sentiment"] = None  # 温度感は別ボタンで生成
 
     # 議事録表示＆編集
     if ss.get("minutes_edited") is not None:
@@ -653,8 +695,24 @@ if ss.aai_data is not None:
         else:
             st.caption("抽出されたToDoはありませんでした。")
 
+        # 感情・温度感レポート
+        st.divider()
+        st.subheader("🌡️ 会議の温度感レポート")
+        st.caption("議論の熱量・対立・合意・発言バランスを分析します（Opus推奨）。")
+        if st.button("温度感レポートを生成", key="gen_sentiment"):
+            client = get_llm_client(backend_name)
+            model = get_llm_model(backend_name)
+            with st.spinner(f"会議の温度感を分析中...（{backend_name}）"):
+                try:
+                    ss["sentiment"] = analyze_sentiment(client, model, diarized)
+                except Exception as e:
+                    st.error(f"分析失敗: {e}")
+
+        if ss.get("sentiment"):
+            st.markdown(ss["sentiment"])
+
         base = os.path.splitext(ss.audio_name)[0]
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             st.download_button("議事録 .md", ss.minutes_edited.encode("utf-8"),
                                file_name=f"{base}_議事録.md", mime="text/markdown")
@@ -665,3 +723,9 @@ if ss.aai_data is not None:
             st.download_button("ToDo .csv", todos_to_csv(todos),
                                file_name=f"{base}_ToDo.csv", mime="text/csv",
                                disabled=not todos)
+        with c4:
+            st.download_button("温度感 .md",
+                               (ss.get("sentiment") or "").encode("utf-8"),
+                               file_name=f"{base}_温度感レポート.md",
+                               mime="text/markdown",
+                               disabled=not ss.get("sentiment"))
