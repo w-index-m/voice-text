@@ -39,6 +39,12 @@ try:
 except ImportError:
     SOUNDFILE_AVAILABLE = False
 
+try:
+    import noisereduce as nr
+    NOISEREDUCE_AVAILABLE = True
+except ImportError:
+    NOISEREDUCE_AVAILABLE = False
+
 from openai import OpenAI
 
 AAI_BASE = "https://api.assemblyai.com/v2"
@@ -176,6 +182,22 @@ def render_waveform(audio_bytes: bytes, file_name: str = ""):
         pass  # 波形表示に失敗しても続行
 
 
+# ----- 音声前処理: ノイズ除去 -----
+def reduce_noise(audio_bytes: bytes) -> bytes:
+    """文字起こし前に音声からノイズ（空調音・環境音等）を除去する。
+    失敗時・ライブラリ未導入時は元の音声をそのまま返す。"""
+    if not (NOISEREDUCE_AVAILABLE and LIBROSA_AVAILABLE and SOUNDFILE_AVAILABLE):
+        return audio_bytes
+    try:
+        y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+        reduced = nr.reduce_noise(y=y, sr=sr, stationary=False)
+        out = io.BytesIO()
+        sf.write(out, reduced, sr, format="WAV")
+        return out.getvalue()
+    except Exception:
+        return audio_bytes
+
+
 # ----- AssemblyAI: 文字起こし -----
 def aai_upload(api_key: str, file_bytes: bytes, max_retries: int = 4) -> str:
     headers = {"authorization": api_key}
@@ -194,11 +216,14 @@ def aai_upload(api_key: str, file_bytes: bytes, max_retries: int = 4) -> str:
 
 
 def aai_transcribe(api_key: str, audio_url: str, language: str,
-                   audio_duration_hint: float | None = None) -> dict:
+                   audio_duration_hint: float | None = None,
+                   remove_disfluencies: bool = True) -> dict:
     headers = {"authorization": api_key}
     payload = {"audio_url": audio_url, "speaker_labels": True}
     if language:
         payload["language_code"] = language
+    # disfluencies=False で「えーと」「あのー」等のフィラーを文字起こしから除去
+    payload["disfluencies"] = not remove_disfluencies
 
     # リトライ付きでジョブ投入
     for attempt in range(4):
@@ -492,6 +517,18 @@ with st.sidebar:
     show_transcript = st.checkbox("話者分離テキスト全文も表示", value=True)
 
     st.divider()
+    st.header("音声前処理")
+    remove_disfluencies = st.checkbox(
+        "フィラー除去（えーと/あのー 等）", value=True,
+        help="文字起こしテキストから意味のないつなぎ言葉を除去します。")
+    use_noise_reduction = st.checkbox(
+        "ノイズ除去（文字起こし前に音声を前処理）", value=False,
+        disabled=not NOISEREDUCE_AVAILABLE,
+        help="空調音・環境音などを軽減して文字起こし精度を上げます。処理に少し時間がかかります。")
+    if not NOISEREDUCE_AVAILABLE:
+        st.caption("ノイズ除去には noisereduce が必要です（requirements.txt に追加済み）。")
+
+    st.divider()
     # セッションリストア
     st.header("セッション復元")
     restore_id = st.text_input("Transcript ID（前回の結果を再利用）",
@@ -579,15 +616,20 @@ if file_bytes is not None:
 
     if st.button("① 文字起こし（話者分離）", type="primary"):
         aai_key = get_aai_key()
+        upload_bytes = file_bytes
+        if use_noise_reduction and NOISEREDUCE_AVAILABLE:
+            with st.spinner("ノイズ除去中..."):
+                upload_bytes = reduce_noise(file_bytes)
         with st.spinner("音声をアップロード中..."):
             try:
-                audio_url = aai_upload(aai_key, file_bytes)
+                audio_url = aai_upload(aai_key, upload_bytes)
             except Exception as e:
                 st.error(f"アップロード失敗: {e}")
                 st.stop()
         try:
             data = aai_transcribe(aai_key, audio_url, language,
-                                  audio_duration_hint=ss.get("audio_duration"))
+                                  audio_duration_hint=ss.get("audio_duration"),
+                                  remove_disfluencies=remove_disfluencies)
         except Exception as e:
             st.error(f"文字起こし失敗: {e}")
             st.stop()
