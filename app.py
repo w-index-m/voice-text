@@ -2,7 +2,7 @@
 音声議事録アプリ (Streamlit)
 - AssemblyAI で文字起こし＋話者分離
 - LLM は Gemini（無料・恒常）/ AssemblyAI LLM Gateway(Claude) を選択可能
-- 話者リネーム / 粒度切替 / ToDo CSV出力
+- 話者自動リネーム / 粒度切替 / ToDo CSV出力 / 議事録編集 / 波形表示
 
 キー構成:
   Gemini使用時  → ASSEMBLYAI_API_KEY + GEMINI_API_KEY
@@ -21,14 +21,28 @@ import json
 import os
 import time
 
+import numpy as np
+import matplotlib.pyplot as plt
 import requests
 import streamlit as st
 from streamlit_mic_recorder import mic_recorder
+
+try:
+    import librosa
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    LIBROSA_AVAILABLE = False
+
+try:
+    import soundfile as sf
+    SOUNDFILE_AVAILABLE = True
+except ImportError:
+    SOUNDFILE_AVAILABLE = False
+
 from openai import OpenAI
 
 AAI_BASE = "https://api.assemblyai.com/v2"
 
-# LLMバックエンド設定
 LLM_BACKENDS = {
     "Gemini 2.5 Flash（無料・推奨）": {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
@@ -41,6 +55,69 @@ LLM_BACKENDS = {
         "key_secret": "ASSEMBLYAI_API_KEY",
     },
 }
+
+# ----- カスタムCSS（ダークモード対応） -----
+def apply_custom_css():
+    st.markdown("""
+    <style>
+    /* ヘッダー */
+    .stApp header { background: transparent; }
+
+    /* タイトル */
+    h1 { font-size: 2rem !important; font-weight: 700 !important; }
+
+    /* プライマリボタン */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        border: none;
+        color: white;
+        font-weight: 600;
+        border-radius: 8px;
+        padding: 0.5rem 1.5rem;
+        transition: opacity 0.2s;
+    }
+    .stButton > button[kind="primary"]:hover { opacity: 0.85; }
+
+    /* セカンダリボタン */
+    .stButton > button[kind="secondary"] {
+        border-radius: 8px;
+        font-weight: 500;
+    }
+
+    /* カード風コンテナ */
+    .card {
+        background: var(--background-color, #1e1e2e);
+        border: 1px solid rgba(99,102,241,0.3);
+        border-radius: 12px;
+        padding: 1rem 1.5rem;
+        margin-bottom: 1rem;
+    }
+
+    /* プログレスバー */
+    .stProgress > div > div { border-radius: 99px; }
+
+    /* テキストエリア */
+    .stTextArea textarea {
+        border-radius: 8px;
+        font-size: 0.9rem;
+        line-height: 1.6;
+    }
+
+    /* サイドバー */
+    [data-testid="stSidebar"] {
+        border-right: 1px solid rgba(99,102,241,0.2);
+    }
+
+    /* ダウンロードボタン */
+    .stDownloadButton > button {
+        border-radius: 8px;
+        width: 100%;
+    }
+
+    /* 成功・警告メッセージ */
+    .stAlert { border-radius: 8px; }
+    </style>
+    """, unsafe_allow_html=True)
 
 
 # ----- キー -----
@@ -65,38 +142,123 @@ def get_llm_model(backend_name: str) -> str:
     return LLM_BACKENDS[backend_name]["model"]
 
 
+# ----- 音声波形の可視化 -----
+def render_waveform(audio_bytes: bytes, file_name: str = ""):
+    if not LIBROSA_AVAILABLE or not SOUNDFILE_AVAILABLE:
+        return
+    try:
+        buf = io.BytesIO(audio_bytes)
+        y, sr = librosa.load(buf, sr=None, mono=True, duration=300)
+        duration = len(y) / sr
+
+        fig, ax = plt.subplots(figsize=(10, 2))
+        fig.patch.set_alpha(0)
+        ax.set_facecolor("none")
+
+        times = np.linspace(0, duration, len(y))
+        ax.fill_between(times, y, -y, alpha=0.7, color="#6366f1")
+        ax.set_xlim(0, duration)
+        ax.set_xlabel("秒", color="#aaa", fontsize=9)
+        ax.set_yticks([])
+        ax.tick_params(colors="#aaa")
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+        st.caption(f"音声長: {int(duration//60)}分{int(duration%60)}秒")
+    except Exception:
+        pass  # 波形表示に失敗しても続行
+
+
 # ----- AssemblyAI: 文字起こし -----
-def aai_upload(api_key: str, file_bytes: bytes) -> str:
+def aai_upload(api_key: str, file_bytes: bytes, max_retries: int = 4) -> str:
     headers = {"authorization": api_key}
-    resp = requests.post(f"{AAI_BASE}/upload", headers=headers, data=file_bytes)
-    resp.raise_for_status()
-    return resp.json()["upload_url"]
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(f"{AAI_BASE}/upload", headers=headers,
+                                 data=file_bytes, timeout=120)
+            resp.raise_for_status()
+            return resp.json()["upload_url"]
+        except requests.RequestException as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            time.sleep(wait)
+    raise RuntimeError("アップロード失敗")
 
 
-def aai_transcribe(api_key: str, audio_url: str, language: str) -> dict:
+def aai_transcribe(api_key: str, audio_url: str, language: str,
+                   audio_duration_hint: float | None = None) -> dict:
     headers = {"authorization": api_key}
     payload = {"audio_url": audio_url, "speaker_labels": True}
     if language:
         payload["language_code"] = language
-    resp = requests.post(f"{AAI_BASE}/transcript", json=payload, headers=headers)
-    resp.raise_for_status()
+
+    # リトライ付きでジョブ投入
+    for attempt in range(4):
+        try:
+            resp = requests.post(f"{AAI_BASE}/transcript", json=payload,
+                                 headers=headers, timeout=30)
+            resp.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+            time.sleep(2 ** attempt)
+
     tid = resp.json()["id"]
+    start_time = time.time()
+
+    # 残り時間推定: AssemblyAI は概ね音声長の 20〜30% の処理時間が目安
+    estimated_total = (audio_duration_hint * 0.25) if audio_duration_hint else 60.0
+    estimated_total = max(estimated_total, 15.0)
 
     progress = st.progress(0.0, text="文字起こし中（話者分離あり）...")
+    status_text = st.empty()
     poll = 0
+    consecutive_errors = 0
+
     while True:
         poll += 1
-        r = requests.get(f"{AAI_BASE}/transcript/{tid}", headers=headers)
-        r.raise_for_status()
+        try:
+            r = requests.get(f"{AAI_BASE}/transcript/{tid}", headers=headers, timeout=15)
+            r.raise_for_status()
+            consecutive_errors = 0
+        except requests.RequestException as e:
+            consecutive_errors += 1
+            if consecutive_errors >= 5:
+                progress.empty()
+                status_text.empty()
+                raise RuntimeError(f"AssemblyAI への接続に繰り返し失敗しました: {e}")
+            time.sleep(3)
+            continue
+
         data = r.json()
         status = data["status"]
+
+        elapsed = time.time() - start_time
+        ratio = min(elapsed / estimated_total, 0.92)
+        remaining = max(0, estimated_total - elapsed)
+
         if status == "completed":
+            progress.progress(1.0, text="文字起こし完了!")
+            time.sleep(0.4)
             progress.empty()
+            status_text.empty()
             return data
+
         if status == "error":
             progress.empty()
+            status_text.empty()
             raise RuntimeError(f"AssemblyAI エラー: {data.get('error')}")
-        progress.progress(min(0.9, poll * 0.03), text=f"文字起こし中... ({status})")
+
+        progress.progress(ratio, text=f"文字起こし中... ({status})")
+        if remaining > 5:
+            status_text.caption(f"推定残り時間: 約 {int(remaining)} 秒")
+        else:
+            status_text.caption("もうすぐ完了します...")
+
         time.sleep(3)
 
 
@@ -111,6 +273,45 @@ def build_diarized_text(data: dict, name_map: dict | None = None) -> str:
         display = name_map.get(label) or f"話者{label}"
         lines.append(f"{display}: {u['text']}")
     return "\n".join(lines)
+
+
+# ----- LLM: 話者自動推定 -----
+def auto_map_speakers(client: OpenAI, model: str,
+                      speakers: list[str], attendees: str,
+                      sample_text: str) -> dict[str, str]:
+    if not attendees.strip() or not speakers:
+        return {}
+    cands = [a.strip() for a in attendees.replace(",", "\n").splitlines() if a.strip()]
+    if not cands:
+        return {}
+
+    system = "会議の文字起こしサンプルと出席者リストから、話者ラベルと実名を対応付けるアシスタント。"
+    user = f"""以下の情報を元に、各話者ラベルに最も対応しそうな出席者名を推定してください。
+推定が難しい場合は空文字にしてください。
+JSON オブジェクトのみ返してください（説明不要）。
+
+話者ラベル: {speakers}
+出席者候補: {cands}
+
+文字起こしサンプル（最初の300文字）:
+{sample_text[:300]}
+
+出力例: {{"A": "田中太郎", "B": "鈴木花子", "C": ""}}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            max_tokens=300,
+            temperature=0.0,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        mapping = json.loads(raw)
+        return {k: v for k, v in mapping.items() if isinstance(v, str) and v}
+    except Exception:
+        return {}
 
 
 # ----- LLM: 議事録 -----
@@ -194,13 +395,41 @@ def todos_to_csv(todos: list[dict]) -> bytes:
     writer.writerow(["タスク", "担当者", "期限"])
     for t in todos:
         writer.writerow([t.get("task", ""), t.get("owner", ""), t.get("due", "")])
-    return ("\ufeff" + buf.getvalue()).encode("utf-8")
+    return ("﻿" + buf.getvalue()).encode("utf-8")
+
+
+# ----- セッション状態の永続化ヘルパー -----
+def save_transcript_cache(aai_data: dict, audio_name: str):
+    """文字起こし結果をキャッシュキーとして保存（同一セッション内での再利用）"""
+    ss = st.session_state
+    ss["aai_data"] = aai_data
+    ss["speakers"] = sorted({u["speaker"] for u in aai_data.get("utterances", [])})
+    ss["audio_name"] = audio_name
+    # セッション間永続化: transcript_id をキャッシュ
+    ss["cached_transcript_id"] = aai_data.get("id")
+
+
+@st.cache_data(show_spinner=False)
+def fetch_cached_transcript(api_key: str, transcript_id: str) -> dict | None:
+    """transcript_id から文字起こし結果を取得（st.cache_data でキャッシュ）"""
+    try:
+        headers = {"authorization": api_key}
+        r = requests.get(f"{AAI_BASE}/transcript/{transcript_id}", headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("status") == "completed":
+            return data
+    except Exception:
+        pass
+    return None
 
 
 # ----- UI -----
 st.set_page_config(page_title="音声議事録", page_icon="🎙️", layout="wide")
+apply_custom_css()
+
 st.title("🎙️ 音声議事録メーカー")
-st.caption("話者分離 / 出席者リネーム / 粒度切替 / ToDo CSV出力")
+st.caption("話者分離 / 自動リネーム / 粒度切替 / ToDo CSV出力 / 議事録編集")
 
 with st.sidebar:
     st.header("LLM設定")
@@ -215,12 +444,28 @@ with st.sidebar:
     meeting_title = st.text_input("会議名（任意）")
     meeting_date = st.text_input("日時（任意・例: 2026-06-27 14:00）")
     attendees = st.text_area("出席者（任意・改行 or カンマ区切り）",
-                             help="事前に名前を入れておくと話者の実名推定に使われます。")
+                             help="入力しておくと話者の実名を自動推定できます。")
     language = st.selectbox("音声の言語",
                             options=[("日本語", "ja"), ("英語", "en"), ("自動判定", "")],
                             format_func=lambda x: x[0])[1]
     granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
     show_transcript = st.checkbox("話者分離テキスト全文も表示", value=True)
+
+    st.divider()
+    # セッションリストア
+    st.header("セッション復元")
+    restore_id = st.text_input("Transcript ID（前回の結果を再利用）",
+                               placeholder="例: abc123...",
+                               help="前回の文字起こしIDを入力するとAPIを再実行せず結果を取得します。")
+    if st.button("復元", disabled=not restore_id.strip()):
+        aai_key = get_aai_key()
+        with st.spinner("文字起こし結果を取得中..."):
+            restored = fetch_cached_transcript(aai_key, restore_id.strip())
+        if restored:
+            save_transcript_cache(restored, st.session_state.get("audio_name", "復元音声"))
+            st.success("復元しました。")
+        else:
+            st.error("取得できませんでした。IDを確認してください。")
 
 # Gemini選択時のキー案内
 if "Gemini" in backend_name:
@@ -237,6 +482,8 @@ ss.setdefault("aai_data", None)
 ss.setdefault("speakers", [])
 ss.setdefault("audio_name", "")
 ss.setdefault("recorded_audio", None)
+ss.setdefault("minutes_edited", None)
+ss.setdefault("audio_duration", None)
 
 tab_rec, tab_up = st.tabs(["🎤 マイク録音", "📁 ファイルアップロード"])
 
@@ -258,6 +505,7 @@ with tab_rec:
         file_bytes = ss.recorded_audio
         audio_name = "録音音声.wav"
         st.audio(ss.recorded_audio, format="audio/wav")
+        render_waveform(ss.recorded_audio, audio_name)
         st.success(f"録音完了 / {len(ss.recorded_audio)/1024:.1f} KB")
         if st.button("録音をクリア", key="clear_rec"):
             ss.recorded_audio = None
@@ -274,9 +522,19 @@ with tab_up:
         audio_name = uploaded.name
         st.info(f"ファイル: {uploaded.name} / {len(file_bytes)/1024/1024:.1f} MB")
         st.audio(file_bytes)
+        render_waveform(file_bytes, audio_name)
 
 # ステップ1: 文字起こし
 if file_bytes is not None:
+    # 音声長を推定（波形取得済みなら利用）
+    audio_duration_hint = None
+    if LIBROSA_AVAILABLE and SOUNDFILE_AVAILABLE:
+        try:
+            y, sr = librosa.load(io.BytesIO(file_bytes), sr=None, mono=True, duration=300)
+            audio_duration_hint = len(y) / sr
+            ss.audio_duration = audio_duration_hint
+        except Exception:
+            pass
 
     if st.button("① 文字起こし（話者分離）", type="primary"):
         aai_key = get_aai_key()
@@ -287,19 +545,21 @@ if file_bytes is not None:
                 st.error(f"アップロード失敗: {e}")
                 st.stop()
         try:
-            data = aai_transcribe(aai_key, audio_url, language)
+            data = aai_transcribe(aai_key, audio_url, language,
+                                  audio_duration_hint=ss.get("audio_duration"))
         except Exception as e:
             st.error(f"文字起こし失敗: {e}")
             st.stop()
-        ss.aai_data = data
-        ss.speakers = sorted({u["speaker"] for u in data.get("utterances", [])})
-        ss.audio_name = audio_name
-        st.success(f"完了。検出話者: {len(ss.speakers)}名")
+        save_transcript_cache(data, audio_name)
+        ss.minutes_edited = None
+        st.success(f"完了。検出話者: {len(ss.speakers)}名 / Transcript ID: `{data.get('id')}`")
+        st.caption("※ このIDをサイドバーに入力すると次回リロード後も結果を復元できます。")
 
 # ステップ2: リネーム & 議事録
 if ss.aai_data is not None:
     st.divider()
-    st.subheader("② 話者の名前を割り当て（任意）")
+    st.subheader("② 話者の名前を割り当て")
+
     raw_text = build_diarized_text(ss.aai_data)
     base_name = os.path.splitext(ss.audio_name)[0]
     st.download_button(
@@ -308,6 +568,27 @@ if ss.aai_data is not None:
         file_name=f"{base_name}_文字起こし.txt",
         mime="text/plain",
     )
+
+    # 自動推定ボタン
+    col_auto, col_hint = st.columns([1, 3])
+    with col_auto:
+        auto_map_clicked = st.button("🤖 話者を自動推定", disabled=not attendees.strip(),
+                                     help="出席者欄の名前をもとにLLMが話者を推定します。")
+    with col_hint:
+        if not attendees.strip():
+            st.caption("サイドバーの「出席者」を入力すると自動推定が使えます。")
+
+    auto_mapping: dict[str, str] = ss.get("auto_mapping", {})
+    if auto_map_clicked and attendees.strip():
+        with st.spinner("話者を推定中..."):
+            client = get_llm_client(backend_name)
+            model = get_llm_model(backend_name)
+            auto_mapping = auto_map_speakers(client, model, ss.speakers, attendees, raw_text)
+            ss["auto_mapping"] = auto_mapping
+        if auto_mapping:
+            st.success("自動推定完了。必要に応じて以下で修正してください。")
+        else:
+            st.warning("推定できませんでした。手動で入力してください。")
 
     if attendees.strip():
         cand = [a.strip() for a in attendees.replace(",", "\n").splitlines() if a.strip()]
@@ -318,7 +599,9 @@ if ss.aai_data is not None:
     cols = st.columns(min(4, max(1, len(ss.speakers))))
     for i, sp in enumerate(ss.speakers):
         with cols[i % len(cols)]:
+            default_name = auto_mapping.get(sp, "")
             name_map[sp] = st.text_input(f"話者{sp} の名前", key=f"name_{sp}",
+                                         value=default_name,
                                          placeholder=f"話者{sp}")
 
     diarized = build_diarized_text(ss.aai_data, name_map)
@@ -342,9 +625,28 @@ if ss.aai_data is not None:
         with st.spinner("ToDoを抽出中..."):
             todos = extract_todos(client, model, diarized)
 
-        st.subheader("📝 議事録")
-        st.markdown(minutes)
+        ss.minutes_edited = minutes
+        ss["todos"] = todos
 
+    # 議事録表示＆編集
+    if ss.get("minutes_edited") is not None:
+        st.subheader("📝 議事録")
+
+        tab_preview, tab_edit = st.tabs(["プレビュー", "✏️ 編集"])
+        with tab_preview:
+            st.markdown(ss.minutes_edited)
+        with tab_edit:
+            edited = st.text_area(
+                "議事録を直接編集できます",
+                value=ss.minutes_edited,
+                height=500,
+                key="minutes_editor",
+            )
+            if edited != ss.minutes_edited:
+                ss.minutes_edited = edited
+                st.rerun()
+
+        todos = ss.get("todos", [])
         if todos:
             st.subheader("✅ ToDo")
             st.dataframe(todos, use_container_width=True)
@@ -354,7 +656,7 @@ if ss.aai_data is not None:
         base = os.path.splitext(ss.audio_name)[0]
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.download_button("議事録 .md", minutes.encode("utf-8"),
+            st.download_button("議事録 .md", ss.minutes_edited.encode("utf-8"),
                                file_name=f"{base}_議事録.md", mime="text/markdown")
         with c2:
             st.download_button("話者分離 .txt", diarized.encode("utf-8"),
