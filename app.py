@@ -158,26 +158,62 @@ def render_waveform(audio_bytes: bytes, file_name: str = ""):
     if not LIBROSA_AVAILABLE or not SOUNDFILE_AVAILABLE:
         return
     try:
+        import matplotlib.colors as mcolors
+        from matplotlib.collections import LineCollection
+
         buf = io.BytesIO(audio_bytes)
         y, sr = librosa.load(buf, sr=None, mono=True, duration=300)
         duration = len(y) / sr
 
-        fig, ax = plt.subplots(figsize=(10, 2))
-        fig.patch.set_alpha(0)
-        ax.set_facecolor("none")
+        # RMS（音の強弱）をフレームごとに算出
+        hop = 512
+        rms = librosa.feature.rms(y=y, hop_length=hop)[0]
+        rms_times = librosa.frames_to_time(np.arange(len(rms)), sr=sr, hop_length=hop)
+        # 0-1 に正規化（強弱の色分け用）
+        rms_norm = rms / (rms.max() + 1e-9)
 
+        fig, (ax_wave, ax_bar) = plt.subplots(
+            2, 1, figsize=(10, 2.6), gridspec_kw={"height_ratios": [3, 1]})
+        fig.patch.set_alpha(0)
+
+        # 上段: 波形を強弱で色分け（静か=青 → 大きい=赤）
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "vol", ["#3b82f6", "#22c55e", "#eab308", "#ef4444"])
+        ax_wave.set_facecolor("none")
+        env = np.interp(np.linspace(0, len(rms_norm) - 1, len(y)),
+                        np.arange(len(rms_norm)), rms_norm)
         times = np.linspace(0, duration, len(y))
-        ax.fill_between(times, y, -y, alpha=0.7, color="#6366f1")
-        ax.set_xlim(0, duration)
-        ax.set_xlabel("秒", color="#aaa", fontsize=9)
-        ax.set_yticks([])
-        ax.tick_params(colors="#aaa")
-        for spine in ax.spines.values():
+        # 強弱に応じて縦線の色を変えて塗る（区間ごとに色付け）
+        step = max(1, len(y) // 1500)
+        for i in range(0, len(y) - step, step):
+            ax_wave.fill_between(times[i:i + step + 1],
+                                 y[i:i + step + 1], -y[i:i + step + 1],
+                                 color=cmap(env[i]), linewidth=0)
+        ax_wave.set_xlim(0, duration)
+        ax_wave.set_yticks([])
+        ax_wave.set_xticks([])
+        for spine in ax_wave.spines.values():
             spine.set_visible(False)
 
+        # 下段: 音量バー（強弱のヒートバー）
+        ax_bar.imshow(rms_norm[np.newaxis, :], aspect="auto", cmap=cmap,
+                      extent=[0, duration, 0, 1], vmin=0, vmax=1)
+        ax_bar.set_yticks([])
+        ax_bar.set_xlabel("秒", color="#aaa", fontsize=9)
+        ax_bar.tick_params(colors="#aaa")
+        for spine in ax_bar.spines.values():
+            spine.set_visible(False)
+
+        fig.tight_layout(pad=0.3)
         st.pyplot(fig, use_container_width=True)
         plt.close(fig)
-        st.caption(f"音声長: {int(duration//60)}分{int(duration%60)}秒")
+
+        peak = rms_times[int(np.argmax(rms))]
+        st.caption(
+            f"音声長: {int(duration//60)}分{int(duration%60)}秒 ／ "
+            f"最大音量: 約{int(peak//60)}分{int(peak%60)}秒付近 "
+            f"（🔵静か → 🔴大きい で色分け）"
+        )
     except Exception:
         pass  # 波形表示に失敗しても続行
 
