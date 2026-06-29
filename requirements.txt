@@ -7,3 +7,4 @@ matplotlib>=3.7
 numpy>=1.24
 soundfile>=0.12
 noisereduce>=3.0
+imageio-ffmpeg>=0.4.9

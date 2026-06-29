@@ -19,6 +19,8 @@ import io
 import csv
 import json
 import os
+import subprocess
+import tempfile
 import time
 
 import numpy as np
@@ -45,7 +47,15 @@ try:
 except ImportError:
     NOISEREDUCE_AVAILABLE = False
 
+try:
+    import imageio_ffmpeg
+    FFMPEG_AVAILABLE = True
+except ImportError:
+    FFMPEG_AVAILABLE = False
+
 from openai import OpenAI
+
+VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
 
 AAI_BASE = "https://api.assemblyai.com/v2"
 
@@ -216,6 +226,33 @@ def render_waveform(audio_bytes: bytes, file_name: str = ""):
         )
     except Exception:
         pass  # 波形表示に失敗しても続行
+
+
+# ----- 動画から音声を抽出 -----
+def extract_audio_from_video(video_bytes: bytes, suffix: str = ".mp4") -> bytes:
+    """ffmpeg(imageio-ffmpeg同梱)で動画から音声をWAV抽出する。"""
+    if not FFMPEG_AVAILABLE:
+        raise RuntimeError(
+            "動画の音声抽出には imageio-ffmpeg が必要です。requirements.txt を確認してください。")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as vf:
+        vf.write(video_bytes)
+        video_path = vf.name
+    audio_path = video_path + ".wav"
+    try:
+        cmd = [ffmpeg_exe, "-y", "-i", video_path,
+               "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", audio_path]
+        subprocess.run(cmd, check=True, capture_output=True)
+        with open(audio_path, "rb") as f:
+            return f.read()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"音声抽出に失敗しました: {e.stderr.decode(errors='ignore')[:300]}")
+    finally:
+        for p in (video_path, audio_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 # ----- 音声前処理: ノイズ除去 -----
@@ -627,16 +664,34 @@ with tab_rec:
 
 with tab_up:
     uploaded = st.file_uploader(
-        "音声ファイルをアップロード",
-        type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"],
-        help="アップロード・分割・話者分離は AssemblyAI 側で処理します。",
+        "音声・動画ファイルをアップロード",
+        type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"]
+        + VIDEO_EXTS,
+        help="動画は音声を自動抽出して文字起こしします（画面内容の解析は行いません）。",
     )
     if uploaded is not None:
-        file_bytes = uploaded.getvalue()
+        raw_bytes = uploaded.getvalue()
         audio_name = uploaded.name
-        st.info(f"ファイル: {uploaded.name} / {len(file_bytes)/1024/1024:.1f} MB")
-        st.audio(file_bytes)
-        render_waveform(file_bytes, audio_name)
+        ext = os.path.splitext(uploaded.name)[1].lower().lstrip(".")
+        is_video = ext in VIDEO_EXTS
+        st.info(f"ファイル: {uploaded.name} / {len(raw_bytes)/1024/1024:.1f} MB"
+                + ("（動画）" if is_video else ""))
+
+        if is_video:
+            st.video(raw_bytes)
+            with st.spinner("動画から音声を抽出中..."):
+                try:
+                    file_bytes = extract_audio_from_video(raw_bytes, suffix=f".{ext}")
+                    st.success("音声を抽出しました。")
+                    st.audio(file_bytes, format="audio/wav")
+                    render_waveform(file_bytes, audio_name)
+                except Exception as e:
+                    st.error(f"{e}")
+                    file_bytes = None
+        else:
+            file_bytes = raw_bytes
+            st.audio(file_bytes)
+            render_waveform(file_bytes, audio_name)
 
 # ステップ1: 文字起こし
 if file_bytes is not None:
