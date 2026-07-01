@@ -1,0 +1,14 @@
+[theme]
+base = "dark"
+primaryColor = "#6366f1"
+backgroundColor = "#0f0f1a"
+secondaryBackgroundColor = "#1e1e2e"
+textColor = "#e5e7eb"
+font = "sans serif"
+
+[server]
+# モバイルからの大きめ動画/音声アップロードに対応
+maxUploadSize = 500
+
+[browser]
+gatherUsageStats = false
