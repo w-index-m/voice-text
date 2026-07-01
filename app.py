@@ -65,12 +65,22 @@ LLM_BACKENDS = {
         "model": "gemini-2.5-flash",
         "key_secret": "GEMINI_API_KEY",
     },
+    "Groq Llama 3.3 70B（高速・無料枠）": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "key_secret": "GROQ_API_KEY",
+    },
     "Claude Sonnet（AssemblyAIクレジット消費）": {
         "base_url": "https://llm-gateway.assemblyai.com/v1",
         "model": "claude-sonnet-4-5-20250929",
         "key_secret": "ASSEMBLYAI_API_KEY",
     },
 }
+
+
+def has_backend_key(backend_name: str) -> bool:
+    secret = LLM_BACKENDS[backend_name]["key_secret"]
+    return bool(st.secrets.get(secret) or os.environ.get(secret))
 
 # ----- カスタムCSS（ダークモード対応） -----
 def apply_custom_css():
@@ -597,10 +607,16 @@ st.caption("話者分離 / 自動リネーム / 粒度切替 / ToDo CSV出力 / 
 
 with st.sidebar:
     st.header("LLM設定")
+    # キーが設定済みのエンジンのみ表示（Geminiは案内のため常に表示）
+    available_backends = [
+        name for name in LLM_BACKENDS
+        if has_backend_key(name) or "Gemini" in name
+    ]
     backend_name = st.radio(
         "議事録整形エンジン",
-        list(LLM_BACKENDS.keys()),
-        help="Geminiは無料枠あり（Google AI StudioでAPIキー発行）。Claudeはコスト有。",
+        available_backends,
+        help="Gemini/Groqは無料枠あり。Claudeはコスト有。"
+             " GroqはSecretに GROQ_API_KEY を追加すると選べます。",
     )
 
     st.divider()
