@@ -137,7 +137,37 @@ def apply_custom_css():
 
     /* 成功・警告メッセージ */
     .stAlert { border-radius: 8px; }
+
+    /* ===== モバイル最適化 / PWA ===== */
+    /* タップターゲットを大きく（44px以上推奨） */
+    .stButton > button, .stDownloadButton > button {
+        min-height: 44px;
+    }
+    /* iOSでの意図しないズームを防ぐ（入力は16px以上） */
+    input, textarea, select { font-size: 16px !important; }
+
+    @media (max-width: 640px) {
+        /* 余白を詰めて画面を有効活用 */
+        .block-container { padding: 1rem 0.8rem 3rem 0.8rem !important; }
+        h1 { font-size: 1.5rem !important; }
+        /* 横並びカラムをスマホでは縦積みに */
+        [data-testid="stHorizontalBlock"] { flex-direction: column; }
+        [data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; }
+        /* タブを折り返し可能に */
+        [data-testid="stTabs"] [role="tablist"] { flex-wrap: wrap; }
+    }
+
+    /* iOSのセーフエリア（ノッチ/ホームバー）対応 */
+    .stApp { padding-bottom: env(safe-area-inset-bottom); }
     </style>
+
+    <!-- PWA / モバイル用メタ情報 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="音声議事録">
+    <meta name="theme-color" content="#6366f1">
     """, unsafe_allow_html=True)
 
 
@@ -563,7 +593,8 @@ def fetch_cached_transcript(api_key: str, transcript_id: str) -> dict | None:
 
 
 # ----- UI -----
-st.set_page_config(page_title="音声議事録", page_icon="🎙️", layout="wide")
+st.set_page_config(page_title="音声議事録", page_icon="🎙️", layout="wide",
+                   initial_sidebar_state="auto")
 apply_custom_css()
 
 st.title("🎙️ 音声議事録メーカー")
@@ -616,6 +647,19 @@ with st.sidebar:
             st.success("復元しました。")
         else:
             st.error("取得できませんでした。IDを確認してください。")
+
+    st.divider()
+    with st.expander("📱 スマホアプリのように使う"):
+        st.markdown(
+            "ホーム画面に追加すると、アプリのように起動できます。\n\n"
+            "**Android (Chrome)**\n"
+            "1. 右上の ⋮ メニューを開く\n"
+            "2. 「ホーム画面に追加」をタップ\n\n"
+            "**iPhone (Safari)**\n"
+            "1. 共有ボタン（□↑）をタップ\n"
+            "2. 「ホーム画面に追加」を選択\n\n"
+            "追加後はアイコンから全画面で起動できます。"
+        )
 
 # Gemini選択時のキー案内
 if "Gemini" in backend_name:
