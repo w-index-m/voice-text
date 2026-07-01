@@ -70,11 +70,6 @@ LLM_BACKENDS = {
         "model": "claude-sonnet-4-5-20250929",
         "key_secret": "ASSEMBLYAI_API_KEY",
     },
-    "Claude Opus（高精度・コスト高）": {
-        "base_url": "https://llm-gateway.assemblyai.com/v1",
-        "model": "claude-opus-4-1-20250805",
-        "key_secret": "ASSEMBLYAI_API_KEY",
-    },
 }
 
 # ----- カスタムCSS（ダークモード対応） -----
@@ -875,7 +870,7 @@ if ss.aai_data is not None:
         # 感情・温度感レポート
         st.divider()
         st.subheader("🌡️ 会議の温度感レポート")
-        st.caption("議論の熱量・対立・合意・発言バランスを分析します（Opus推奨）。")
+        st.caption("議論の熱量・対立・合意・発言バランスを分析します。")
         if st.button("温度感レポートを生成", key="gen_sentiment"):
             client = get_llm_client(backend_name)
             model = get_llm_model(backend_name)
