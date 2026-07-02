@@ -198,6 +198,29 @@ def get_llm_model(backend_name: str) -> str:
     return LLM_BACKENDS[backend_name]["model"]
 
 
+# ----- 音声の長さ算出 -----
+def get_audio_duration(audio_bytes: bytes) -> float:
+    """音声の長さ（秒）を返す。取得できなければ0.0。"""
+    # まず標準ライブラリのwaveで試す（WAVなら依存なしで高速）
+    try:
+        import wave
+        with wave.open(io.BytesIO(audio_bytes), "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate:
+                return frames / float(rate)
+    except Exception:
+        pass
+    # WAV以外はlibrosaにフォールバック
+    if LIBROSA_AVAILABLE and SOUNDFILE_AVAILABLE:
+        try:
+            y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+            return len(y) / sr
+        except Exception:
+            pass
+    return 0.0
+
+
 # ----- 音声波形の可視化 -----
 def render_waveform(audio_bytes: bytes, file_name: str = ""):
     if not LIBROSA_AVAILABLE or not SOUNDFILE_AVAILABLE:
@@ -714,7 +737,9 @@ with tab_rec:
         audio_name = "録音音声.wav"
         st.audio(ss.recorded_audio, format="audio/wav")
         render_waveform(ss.recorded_audio, audio_name)
-        st.success(f"録音完了 / {len(ss.recorded_audio)/1024:.1f} KB")
+        dur = get_audio_duration(ss.recorded_audio)
+        dur_text = f"録音時間 {int(dur//60)}分{int(dur%60)}秒 / " if dur else ""
+        st.success(f"録音完了 / {dur_text}{len(ss.recorded_audio)/1024:.1f} KB")
         if st.button("録音をクリア", key="clear_rec"):
             ss.recorded_audio = None
             st.rerun()
