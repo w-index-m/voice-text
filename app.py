@@ -576,7 +576,9 @@ def save_transcript_cache(aai_data: dict, audio_name: str):
     """文字起こし結果をキャッシュキーとして保存（同一セッション内での再利用）"""
     ss = st.session_state
     ss["aai_data"] = aai_data
-    ss["speakers"] = sorted({u["speaker"] for u in aai_data.get("utterances", [])})
+    # utterances は話者が検出されないと None になり得るため or [] で保護
+    utterances = aai_data.get("utterances") or []
+    ss["speakers"] = sorted({u["speaker"] for u in utterances})
     ss["audio_name"] = audio_name
     # セッション間永続化: transcript_id をキャッシュ
     ss["cached_transcript_id"] = aai_data.get("id")
