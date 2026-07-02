@@ -198,6 +198,29 @@ def get_llm_model(backend_name: str) -> str:
     return LLM_BACKENDS[backend_name]["model"]
 
 
+# ----- 音声の長さ算出 -----
+def get_audio_duration(audio_bytes: bytes) -> float:
+    """音声の長さ（秒）を返す。取得できなければ0.0。"""
+    # まず標準ライブラリのwaveで試す（WAVなら依存なしで高速）
+    try:
+        import wave
+        with wave.open(io.BytesIO(audio_bytes), "rb") as w:
+            frames = w.getnframes()
+            rate = w.getframerate()
+            if rate:
+                return frames / float(rate)
+    except Exception:
+        pass
+    # WAV以外はlibrosaにフォールバック
+    if LIBROSA_AVAILABLE and SOUNDFILE_AVAILABLE:
+        try:
+            y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+            return len(y) / sr
+        except Exception:
+            pass
+    return 0.0
+
+
 # ----- 音声波形の可視化 -----
 def render_waveform(audio_bytes: bytes, file_name: str = ""):
     if not LIBROSA_AVAILABLE or not SOUNDFILE_AVAILABLE:
@@ -506,6 +529,35 @@ def summarize(client: OpenAI, model: str, diarized_text: str,
     return resp.choices[0].message.content
 
 
+def reproduce_verbatim(client: OpenAI, model: str, diarized_text: str,
+                       meeting_title: str, meeting_date: str) -> str:
+    """要約せず、聞いたままの発言を忠実に再現する（読みやすさのみ整える）。"""
+    system = (
+        "あなたは正確な書き起こし編集者です。話者ラベル付きの文字起こしを、"
+        "内容を要約・省略・言い換えせず、聞いたままを忠実に再現してください。"
+        "行うのは読みやすさの調整のみ（句読点の補正、明らかな誤変換の修正、"
+        "重複した言い淀みの軽い整理）で、発言の順序・内容・ニュアンスは保持します。"
+    )
+    header = ""
+    if meeting_title or meeting_date:
+        header = (f"# {meeting_title or '会議'}"
+                  + (f"（{meeting_date}）" if meeting_date else "") + "\n\n")
+    user = f"""以下の文字起こしを、話者ごとの発言として忠実に再現してください。
+要約や省略はせず、全ての発言を「話者: 発言」の形式で Markdown 出力してください。
+
+---
+{diarized_text}
+"""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        max_tokens=8000,
+        temperature=0.0,
+    )
+    return header + (resp.choices[0].message.content or "")
+
+
 def analyze_sentiment(client: OpenAI, model: str, diarized_text: str) -> str:
     system = (
         "あなたは会議のファシリテーション分析の専門家です。"
@@ -630,7 +682,16 @@ with st.sidebar:
     language = st.selectbox("音声の言語",
                             options=[("日本語", "ja"), ("英語", "en"), ("自動判定", "")],
                             format_func=lambda x: x[0])[1]
-    granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
+    output_mode = st.radio(
+        "出力タイプ",
+        ["議事録（要約・構造化）", "聞いたままの再現（逐語）"],
+        help="「議事録」は要点をまとめて構造化。「聞いたまま」は要約せず発言を忠実に再現します。",
+    )
+    is_verbatim = output_mode.startswith("聞いたまま")
+    if not is_verbatim:
+        granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
+    else:
+        granularity = "詳細議事録"  # 逐語モードでは未使用
     show_transcript = st.checkbox("話者分離テキスト全文も表示", value=True)
 
     st.divider()
@@ -714,7 +775,9 @@ with tab_rec:
         audio_name = "録音音声.wav"
         st.audio(ss.recorded_audio, format="audio/wav")
         render_waveform(ss.recorded_audio, audio_name)
-        st.success(f"録音完了 / {len(ss.recorded_audio)/1024:.1f} KB")
+        dur = get_audio_duration(ss.recorded_audio)
+        dur_text = f"録音時間 {int(dur//60)}分{int(dur%60)}秒 / " if dur else ""
+        st.success(f"録音完了 / {dur_text}{len(ss.recorded_audio)/1024:.1f} KB")
         if st.button("録音をクリア", key="clear_rec"):
             ss.recorded_audio = None
             st.rerun()
@@ -841,20 +904,30 @@ if ss.aai_data is not None:
         with st.expander("話者分離テキスト全文", expanded=False):
             st.text_area("transcript", diarized, height=300)
 
-    if st.button("③ 議事録を作成", type="primary"):
+    gen_label = "③ 逐語再現を作成" if is_verbatim else "③ 議事録を作成"
+    if st.button(gen_label, type="primary"):
         client = get_llm_client(backend_name)
         model = get_llm_model(backend_name)
 
-        with st.spinner(f"議事録を整形中...（{backend_name}）"):
+        spin_label = "聞いたまま再現中" if is_verbatim else "議事録を整形中"
+        with st.spinner(f"{spin_label}...（{backend_name}）"):
             try:
-                minutes = summarize(client, model, diarized, meeting_title,
-                                    meeting_date, attendees, granularity)
+                if is_verbatim:
+                    minutes = reproduce_verbatim(client, model, diarized,
+                                                 meeting_title, meeting_date)
+                else:
+                    minutes = summarize(client, model, diarized, meeting_title,
+                                        meeting_date, attendees, granularity)
             except Exception as e:
-                st.error(f"議事録整形失敗: {e}")
+                st.error(f"生成に失敗しました: {e}")
                 st.stop()
 
-        with st.spinner("ToDoを抽出中..."):
-            todos = extract_todos(client, model, diarized)
+        # ToDo抽出は議事録モードのみ
+        if is_verbatim:
+            todos = []
+        else:
+            with st.spinner("ToDoを抽出中..."):
+                todos = extract_todos(client, model, diarized)
 
         ss.minutes_edited = minutes
         ss["todos"] = todos
@@ -862,14 +935,15 @@ if ss.aai_data is not None:
 
     # 議事録表示＆編集
     if ss.get("minutes_edited") is not None:
-        st.subheader("📝 議事録")
+        out_heading = "📝 逐語再現（聞いたまま）" if is_verbatim else "📝 議事録"
+        st.subheader(out_heading)
 
         tab_preview, tab_edit = st.tabs(["プレビュー", "✏️ 編集"])
         with tab_preview:
             st.markdown(ss.minutes_edited)
         with tab_edit:
             edited = st.text_area(
-                "議事録を直接編集できます",
+                "内容を直接編集できます",
                 value=ss.minutes_edited,
                 height=500,
                 key="minutes_editor",
@@ -882,7 +956,7 @@ if ss.aai_data is not None:
         if todos:
             st.subheader("✅ ToDo")
             st.dataframe(todos, use_container_width=True)
-        else:
+        elif not is_verbatim:
             st.caption("抽出されたToDoはありませんでした。")
 
         # 感情・温度感レポート
@@ -904,8 +978,10 @@ if ss.aai_data is not None:
         base = os.path.splitext(ss.audio_name)[0]
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.download_button("議事録 .md", ss.minutes_edited.encode("utf-8"),
-                               file_name=f"{base}_議事録.md", mime="text/markdown")
+            dl_label = "逐語 .md" if is_verbatim else "議事録 .md"
+            dl_name = f"{base}_逐語.md" if is_verbatim else f"{base}_議事録.md"
+            st.download_button(dl_label, ss.minutes_edited.encode("utf-8"),
+                               file_name=dl_name, mime="text/markdown")
         with c2:
             st.download_button("話者分離 .txt", diarized.encode("utf-8"),
                                file_name=f"{base}_話者分離.txt", mime="text/plain")
