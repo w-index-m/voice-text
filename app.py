@@ -65,17 +65,22 @@ LLM_BACKENDS = {
         "model": "gemini-2.5-flash",
         "key_secret": "GEMINI_API_KEY",
     },
+    "Groq Llama 3.3 70B（高速・無料枠）": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "key_secret": "GROQ_API_KEY",
+    },
     "Claude Sonnet（AssemblyAIクレジット消費）": {
         "base_url": "https://llm-gateway.assemblyai.com/v1",
         "model": "claude-sonnet-4-5-20250929",
         "key_secret": "ASSEMBLYAI_API_KEY",
     },
-    "Claude Opus（高精度・コスト高）": {
-        "base_url": "https://llm-gateway.assemblyai.com/v1",
-        "model": "claude-opus-4-1-20250805",
-        "key_secret": "ASSEMBLYAI_API_KEY",
-    },
 }
+
+
+def has_backend_key(backend_name: str) -> bool:
+    secret = LLM_BACKENDS[backend_name]["key_secret"]
+    return bool(st.secrets.get(secret) or os.environ.get(secret))
 
 # ----- カスタムCSS（ダークモード対応） -----
 def apply_custom_css():
@@ -571,7 +576,9 @@ def save_transcript_cache(aai_data: dict, audio_name: str):
     """文字起こし結果をキャッシュキーとして保存（同一セッション内での再利用）"""
     ss = st.session_state
     ss["aai_data"] = aai_data
-    ss["speakers"] = sorted({u["speaker"] for u in aai_data.get("utterances", [])})
+    # utterances は話者が検出されないと None になり得るため or [] で保護
+    utterances = aai_data.get("utterances") or []
+    ss["speakers"] = sorted({u["speaker"] for u in utterances})
     ss["audio_name"] = audio_name
     # セッション間永続化: transcript_id をキャッシュ
     ss["cached_transcript_id"] = aai_data.get("id")
@@ -602,10 +609,16 @@ st.caption("話者分離 / 自動リネーム / 粒度切替 / ToDo CSV出力 / 
 
 with st.sidebar:
     st.header("LLM設定")
+    # キーが設定済みのエンジンのみ表示（Geminiは案内のため常に表示）
+    available_backends = [
+        name for name in LLM_BACKENDS
+        if has_backend_key(name) or "Gemini" in name
+    ]
     backend_name = st.radio(
         "議事録整形エンジン",
-        list(LLM_BACKENDS.keys()),
-        help="Geminiは無料枠あり（Google AI StudioでAPIキー発行）。Claudeはコスト有。",
+        available_backends,
+        help="Gemini/Groqは無料枠あり。Claudeはコスト有。"
+             " GroqはSecretに GROQ_API_KEY を追加すると選べます。",
     )
 
     st.divider()
@@ -875,7 +888,7 @@ if ss.aai_data is not None:
         # 感情・温度感レポート
         st.divider()
         st.subheader("🌡️ 会議の温度感レポート")
-        st.caption("議論の熱量・対立・合意・発言バランスを分析します（Opus推奨）。")
+        st.caption("議論の熱量・対立・合意・発言バランスを分析します。")
         if st.button("温度感レポートを生成", key="gen_sentiment"):
             client = get_llm_client(backend_name)
             model = get_llm_model(backend_name)
