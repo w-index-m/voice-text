@@ -222,6 +222,17 @@ def get_audio_duration(audio_bytes: bytes) -> float:
     return 0.0
 
 
+def fmt_duration_ja(seconds: float) -> str:
+    """秒数を日本語表記に整形。1時間以上は「○時間○分○秒」。"""
+    total = int(seconds)
+    h, m, s = total // 3600, (total % 3600) // 60, total % 60
+    if h > 0:
+        return f"{h}時間{m}分{s}秒"
+    if m > 0:
+        return f"{m}分{s}秒"
+    return f"{s}秒"
+
+
 # ----- 音声波形の可視化 -----
 def render_waveform(audio_bytes: bytes, file_name: str = ""):
     if not LIBROSA_AVAILABLE or not SOUNDFILE_AVAILABLE:
@@ -279,8 +290,8 @@ def render_waveform(audio_bytes: bytes, file_name: str = ""):
 
         peak = rms_times[int(np.argmax(rms))]
         st.caption(
-            f"音声長: {int(duration//60)}分{int(duration%60)}秒 ／ "
-            f"最大音量: 約{int(peak//60)}分{int(peak%60)}秒付近 "
+            f"音声長: {fmt_duration_ja(duration)} ／ "
+            f"最大音量: 約{fmt_duration_ja(peak)}付近 "
             f"（🔵静か → 🔴大きい で色分け）"
         )
     except Exception:
@@ -772,8 +783,11 @@ with tab_rec:
         <script>
         (function(){
           const el = document.getElementById('rec-timer');
-          const fmt = s => String(Math.floor(s/60)).padStart(2,'0')+':'
-                          +String(s%60).padStart(2,'0');
+          const fmt = function(s){
+            const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+            const mm=String(m).padStart(2,'0'), ss=String(sec).padStart(2,'0');
+            return h>0 ? (h+':'+mm+':'+ss) : (mm+':'+ss);
+          };
           function recordingState(){
             try{
               const frames = window.parent.document.querySelectorAll('iframe');
@@ -824,7 +838,7 @@ with tab_rec:
         st.audio(ss.recorded_audio, format="audio/wav")
         render_waveform(ss.recorded_audio, audio_name)
         dur = get_audio_duration(ss.recorded_audio)
-        dur_text = f"録音時間 {int(dur//60)}分{int(dur%60)}秒 / " if dur else ""
+        dur_text = f"録音時間 {fmt_duration_ja(dur)} / " if dur else ""
         st.success(f"録音完了 / {dur_text}{len(ss.recorded_audio)/1024:.1f} KB")
         if st.button("録音をクリア", key="clear_rec"):
             ss.recorded_audio = None
