@@ -27,6 +27,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_mic_recorder import mic_recorder
 
 try:
@@ -761,6 +762,53 @@ audio_name = ""
 
 with tab_rec:
     st.caption("「録音開始」を押してマイクに話しかけ、終わったら「録音停止」を押す")
+
+    # 録音中のリアルタイム経過時間タイマー（録音ボタンの状態をJSで監視）
+    components.html(
+        """
+        <div id="rec-timer" style="font-family:sans-serif;font-size:1.4rem;
+             font-weight:700;color:#888;padding:6px 12px;border-radius:8px;
+             display:inline-block;">⏱ 待機中 00:00</div>
+        <script>
+        (function(){
+          const el = document.getElementById('rec-timer');
+          const fmt = s => String(Math.floor(s/60)).padStart(2,'0')+':'
+                          +String(s%60).padStart(2,'0');
+          function recordingState(){
+            try{
+              const frames = window.parent.document.querySelectorAll('iframe');
+              for(const f of frames){
+                let d; try{ d = f.contentDocument; }catch(e){ continue; }
+                if(!d) continue;
+                for(const b of d.querySelectorAll('button')){
+                  const t=(b.innerText||b.textContent||'').trim();
+                  if(t.indexOf('録音停止')>=0) return true;
+                  if(t.indexOf('録音開始')>=0) return false;
+                }
+              }
+            }catch(e){}
+            return null;
+          }
+          let recording=false, start=0;
+          setInterval(function(){
+            const s = recordingState();
+            if(s===true){
+              if(!recording){ recording=true; start=Date.now(); }
+              const sec=Math.floor((Date.now()-start)/1000);
+              el.textContent='🔴 録音中 '+fmt(sec);
+              el.style.color='#ef4444';
+            } else if(s===false){
+              recording=false;
+              el.textContent='⏱ 待機中 00:00';
+              el.style.color='#888';
+            }
+          }, 250);
+        })();
+        </script>
+        """,
+        height=48,
+    )
+
     recorded = mic_recorder(
         start_prompt="🎤 録音開始",
         stop_prompt="⏹ 録音停止",
