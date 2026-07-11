@@ -542,20 +542,32 @@ def summarize(client: OpenAI, model: str, diarized_text: str,
 
 
 def reproduce_verbatim(client: OpenAI, model: str, diarized_text: str,
-                       meeting_title: str, meeting_date: str) -> str:
-    """要約せず、聞いたままの発言を忠実に再現する（読みやすさのみ整える）。"""
-    system = (
-        "あなたは正確な書き起こし編集者です。話者ラベル付きの文字起こしを、"
-        "内容を要約・省略・言い換えせず、聞いたままを忠実に再現してください。"
-        "行うのは読みやすさの調整のみ（句読点の補正、明らかな誤変換の修正、"
-        "重複した言い淀みの軽い整理）で、発言の順序・内容・ニュアンスは保持します。"
-    )
+                       meeting_title: str, meeting_date: str,
+                       translate_ja: bool = False) -> str:
+    """要約せず、聞いたままの発言を忠実に再現する（読みやすさのみ整える）。
+    translate_ja=True の場合は、内容を省略せず日本語に翻訳して再現する。"""
+    if translate_ja:
+        system = (
+            "あなたは正確な通訳・書き起こし編集者です。話者ラベル付きの文字起こしを、"
+            "内容を要約・省略せず、全ての発言を自然な日本語に翻訳して再現してください。"
+            "発言の順序・内容・ニュアンスは保持し、省略や意訳のしすぎは避けます。"
+        )
+        instruction = ("以下の文字起こしを、話者ごとの発言として日本語に翻訳し忠実に再現してください。"
+                       "要約や省略はせず、全ての発言を「話者: 日本語訳」の形式で Markdown 出力してください。")
+    else:
+        system = (
+            "あなたは正確な書き起こし編集者です。話者ラベル付きの文字起こしを、"
+            "内容を要約・省略・言い換えせず、聞いたままを忠実に再現してください。"
+            "行うのは読みやすさの調整のみ（句読点の補正、明らかな誤変換の修正、"
+            "重複した言い淀みの軽い整理）で、発言の順序・内容・ニュアンスは保持します。"
+        )
+        instruction = ("以下の文字起こしを、話者ごとの発言として忠実に再現してください。"
+                       "要約や省略はせず、全ての発言を「話者: 発言」の形式で Markdown 出力してください。")
     header = ""
     if meeting_title or meeting_date:
         header = (f"# {meeting_title or '会議'}"
                   + (f"（{meeting_date}）" if meeting_date else "") + "\n\n")
-    user = f"""以下の文字起こしを、話者ごとの発言として忠実に再現してください。
-要約や省略はせず、全ての発言を「話者: 発言」の形式で Markdown 出力してください。
+    user = f"""{instruction}
 
 ---
 {diarized_text}
@@ -700,10 +712,17 @@ with st.sidebar:
         help="「議事録」は要点をまとめて構造化。「聞いたまま」は要約せず発言を忠実に再現します。",
     )
     is_verbatim = output_mode.startswith("聞いたまま")
+    verbatim_translate_ja = False
     if not is_verbatim:
         granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
     else:
         granularity = "詳細議事録"  # 逐語モードでは未使用
+        verbatim_lang = st.radio(
+            "逐語の言語",
+            ["原文のまま", "日本語に翻訳"],
+            help="英語などの音声を、そのまま再現するか日本語に翻訳して再現するか選べます。",
+        )
+        verbatim_translate_ja = verbatim_lang == "日本語に翻訳"
     show_transcript = st.checkbox("話者分離テキスト全文も表示", value=True)
 
     st.divider()
@@ -976,7 +995,8 @@ if ss.aai_data is not None:
             try:
                 if is_verbatim:
                     minutes = reproduce_verbatim(client, model, diarized,
-                                                 meeting_title, meeting_date)
+                                                 meeting_title, meeting_date,
+                                                 translate_ja=verbatim_translate_ja)
                 else:
                     minutes = summarize(client, model, diarized, meeting_title,
                                         meeting_date, attendees, granularity)
