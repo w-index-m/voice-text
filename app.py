@@ -598,29 +598,39 @@ def translate_to_en(client: OpenAI, model: str, text: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def get_aai_llm_client() -> OpenAI | None:
+    """AssemblyAI LLM Gateway(Claude)のOpenAI互換クライアント。キー未設定ならNone。"""
+    key = st.secrets.get("ASSEMBLYAI_API_KEY") or os.environ.get("ASSEMBLYAI_API_KEY")
+    if not key:
+        return None
+    return OpenAI(api_key=key, base_url="https://llm-gateway.assemblyai.com/v1")
+
+
 def translate_with_fallback(client: OpenAI, model: str, text: str,
                             direction: str) -> tuple[str, str]:
-    """翻訳を実行し、失敗/空ならGroqに自動フォールバックする。
-    戻り値: (翻訳結果, 使用エンジンの注記)。両方失敗なら ("", エラー内容)。"""
+    """翻訳を実行し、失敗/空なら Groq → AssemblyAI(Claude) の順に自動フォールバック。
+    戻り値: (翻訳結果, 使用エンジンの注記)。全滅なら ("", エラー内容)。"""
     fn = translate_to_en if direction == "en" else translate_to_ja
-    err = ""
-    try:
-        out = fn(client, model, text)
-        if out.strip():
-            return out, ""
-        err = "主エンジンが空を返しました"
-    except Exception as e:
-        err = f"主エンジンエラー: {e}"
-    # Groqへフォールバック
+    # (クライアント, モデル, 注記) のフォールバック連鎖
+    chain: list[tuple[OpenAI, str, str]] = [(client, model, "")]
     gc = get_groq_client()
     if gc is not None:
+        chain.append((gc, "llama-3.3-70b-versatile", "（Groqにフォールバック）"))
+    ac = get_aai_llm_client()
+    if ac is not None:
+        chain.append((ac, "claude-sonnet-4-5-20250929",
+                      "（AssemblyAI/Claudeにフォールバック）"))
+
+    errs = []
+    for cl, md, note in chain:
         try:
-            out = fn(gc, "llama-3.3-70b-versatile", text)
+            out = fn(cl, md, text)
             if out.strip():
-                return out, "（Groqにフォールバック）"
+                return out, note
+            errs.append(f"{md}:空")
         except Exception as e:
-            return "", f"{err} / Groqも失敗: {e}"
-    return "", f"{err}（GroqキーGROQ_API_KEY未設定でフォールバック不可）"
+            errs.append(f"{md}:{e}")
+    return "", " / ".join(errs)
 
 
 # ----- LLM: 話者自動推定 -----
@@ -865,11 +875,16 @@ with st.sidebar:
         name for name in LLM_BACKENDS
         if has_backend_key(name) or "Gemini" in name
     ]
+    # Groqが使えるならデフォルトに（Geminiは無料枠が1日20回と少ないため）
+    default_idx = next((i for i, n in enumerate(available_backends)
+                        if "Groq" in n), 0)
     backend_name = st.radio(
         "議事録整形エンジン",
         available_backends,
-        help="Gemini/Groqは無料枠あり。Claudeはコスト有。"
-             " GroqはSecretに GROQ_API_KEY を追加すると選べます。",
+        index=default_idx,
+        help="Gemini/Groqは無料枠あり。Geminiの無料枠は1日20回と少なめ。"
+             " GroqはSecretに GROQ_API_KEY を追加すると選べます。"
+             " 翻訳は失敗時にGroq→AssemblyAIへ自動フォールバックします。",
     )
 
     st.divider()
