@@ -1249,21 +1249,9 @@ with tab_vo:
             + " 「START」→ マイク許可 → 日本語で話す。")
 
         ss.setdefault("vo_log", [])
-        vc1, vc2 = st.columns([1, 1])
-        with vc1:
-            # 音声アンロック（iOS Safari対策）: タップで音声再生を解錠
-            if st.button("🔓 音声を有効化(iOS)", key="vo_unlock"):
-                components.html(
-                    """<script>
-                    try{
-                      const u=new SpeechSynthesisUtterance(' ');
-                      u.volume=0; window.speechSynthesis.speak(u);
-                    }catch(e){}
-                    </script>""", height=0)
-                st.caption("音声を有効化しました。")
-        with vc2:
-            if st.button("🗑 表示をクリア", key="vo_clear"):
-                ss.vo_log = []
+        if st.button("🗑 表示をクリア", key="vo_clear"):
+            ss.vo_log = []
+        st.caption("下の「START」を押すだけで開始できます（音声はmp3で再生されます）。")
 
         vo_ctx = webrtc_streamer(
             key="voice-interpret",
