@@ -61,6 +61,12 @@ try:
 except ImportError:
     WEBRTC_AVAILABLE = False
 
+try:
+    from gtts import gTTS
+    GTTS_AVAILABLE = True
+except ImportError:
+    GTTS_AVAILABLE = False
+
 from openai import OpenAI
 
 VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
@@ -598,20 +604,42 @@ def translate_to_en(client: OpenAI, model: str, text: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+# Whisperが無音時に生成しがちな定番の幻聴フレーズ
+WHISPER_HALLUCINATIONS = [
+    "thank you for watching", "thanks for watching", "subtitles",
+    "subscribe", "dimatorzok", "ご視聴ありがとう", "チャンネル登録",
+    "字幕", "見てくれてありがとう", "お疲れ様でした",
+]
+
+
 def is_noise_text(ja: str, en: str = "") -> bool:
-    """無音・雑音由来の無意味な文字起こし/翻訳を判定する。"""
+    """無音・雑音由来の無意味な文字起こし/翻訳・Whisperの幻聴を判定する。"""
     j = ja.strip()
-    # 記号や極端に短い認識は雑音とみなす
     if len(j) <= 1 or all(not ch.isalnum() for ch in j):
         return True
-    e = en.strip().lower()
+    low = (j + " " + en).lower()
+    if any(h in low for h in WHISPER_HALLUCINATIONS):
+        return True
     junk = [
         "no input", "no text", "nothing to translate", "there is no",
         "translate the", "翻訳する", "入力があり", "テキストがあり",
     ]
+    e = en.strip().lower()
     if e and any(k in e for k in junk):
         return True
     return False
+
+
+def tts_english_bytes(text: str) -> bytes | None:
+    """英語テキストをmp3音声に変換（gTTS・無料）。失敗時None。"""
+    if not GTTS_AVAILABLE or not text.strip():
+        return None
+    try:
+        buf = io.BytesIO()
+        gTTS(text=text, lang="en").write_to_fp(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
 
 
 def get_aai_llm_client() -> OpenAI | None:
@@ -1240,18 +1268,15 @@ with tab_vo:
         vo_speak = st.empty()
         if ss.vo_log:
             vo_box.markdown("### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
-            # 手動読み上げ（iOSでも確実に鳴る＝タップ操作のため）
+            # 停止後: 全文の英語音声を生成して再生（タップで確実に鳴る）
             if not vo_ctx.state.playing:
-                if st.button("🔊 最新の英語を読み上げ", key="vo_read"):
-                    components.html(
-                        f"""<script>
-                        try{{
-                          const u=new SpeechSynthesisUtterance({json.dumps(ss.vo_log[-1])});
-                          u.lang='en-US'; u.rate=1.0;
-                          window.speechSynthesis.cancel();
-                          window.speechSynthesis.speak(u);
-                        }}catch(e){{}}
-                        </script>""", height=0)
+                if st.button("🔊 英語音声を生成して再生", key="vo_read"):
+                    mp3 = tts_english_bytes(" ".join(ss.vo_log))
+                    if mp3:
+                        with vo_speak:
+                            st.audio(mp3, format="audio/mp3", autoplay=True)
+                    else:
+                        st.caption("音声生成に失敗しました（gTTS未導入の可能性）。")
 
         if vo_ctx.state.playing:
             aai_key = get_aai_key()
@@ -1290,6 +1315,11 @@ with tab_vo:
                         level = max(levels) if levels else 0.0
                     except Exception:
                         level = -1.0
+                    # 音量ゲート: 小さすぎる区間は幻聴を避けるため文字起こししない
+                    if level >= 0 and level < 0.02:
+                        vo_debug.caption(f"🔇 無音のためスキップ（音量レベル={level:.4f}）")
+                        vo_status.caption("🎤 録音中...")
+                        continue
                     wav = frames_to_wav_bytes(frame_buffer2)
                     frame_buffer2 = []
                     if not wav:
@@ -1315,18 +1345,11 @@ with tab_vo:
                         ss.vo_log.append(en)
                         vo_box.markdown(
                             "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
-                        # ブラウザTTSで英語読み上げ
-                        safe = json.dumps(en)
-                        with vo_speak:
-                            components.html(
-                                f"""<script>
-                                try{{
-                                  const u=new SpeechSynthesisUtterance({safe});
-                                  u.lang='en-US'; u.rate=1.0;
-                                  window.speechSynthesis.cancel();
-                                  window.speechSynthesis.speak(u);
-                                }}catch(e){{}}
-                                </script>""", height=0)
+                        # 英語音声(mp3)を生成して再生（gTTS・ブラウザ非依存で確実）
+                        mp3 = tts_english_bytes(en)
+                        if mp3:
+                            with vo_speak:
+                                st.audio(mp3, format="audio/mp3", autoplay=True)
                     except Exception as e:
                         vo_debug.caption(f"エラー: {e}")
                     vo_status.caption("🎤 録音中...")
