@@ -9,3 +9,4 @@ soundfile>=0.12
 noisereduce>=3.0
 imageio-ffmpeg>=0.4.9
 streamlit-webrtc>=0.47
+gTTS>=2.5
