@@ -54,6 +54,13 @@ try:
 except ImportError:
     FFMPEG_AVAILABLE = False
 
+try:
+    import queue
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode
+    WEBRTC_AVAILABLE = True
+except ImportError:
+    WEBRTC_AVAILABLE = False
+
 from openai import OpenAI
 
 VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
@@ -448,6 +455,91 @@ def build_diarized_text(data: dict, name_map: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+# ----- リアルタイム翻訳（実験）用ヘルパー -----
+def frames_to_wav_bytes(frames: list, target_rate: int = 16000) -> bytes | None:
+    """streamlit-webrtc の音声フレーム列を16kHzモノラルWAVバイト列に変換する。"""
+    import wave
+    if not frames:
+        return None
+    try:
+        chunks = []
+        src_rate = None
+        for f in frames:
+            arr = f.to_ndarray()
+            src_rate = f.sample_rate
+            if arr.ndim == 2:  # (channels, samples) → モノラル化
+                arr = arr.mean(axis=0)
+            arr = arr.flatten().astype(np.float32)
+            # 整数型なら-1..1へ正規化
+            if np.max(np.abs(arr)) > 1.5:
+                arr = arr / 32768.0
+            chunks.append(arr)
+        if not chunks or not src_rate:
+            return None
+        samples = np.concatenate(chunks)
+        # 16kHzへ簡易リサンプル
+        if src_rate != target_rate:
+            n = int(len(samples) * target_rate / src_rate)
+            if n <= 0:
+                return None
+            samples = np.interp(
+                np.linspace(0, len(samples) - 1, n),
+                np.arange(len(samples)), samples)
+        pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(target_rate)
+            w.writeframes(pcm.tobytes())
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+def aai_transcribe_quick(api_key: str, audio_url: str, language: str = "en") -> str:
+    """話者分離なしの軽量な文字起こし（リアルタイム用・完了までポーリング）。"""
+    headers = {"authorization": api_key}
+    payload = {"audio_url": audio_url}
+    if language:
+        payload["language_code"] = language
+    resp = requests.post(f"{AAI_BASE}/transcript", json=payload,
+                         headers=headers, timeout=30)
+    resp.raise_for_status()
+    tid = resp.json()["id"]
+    for _ in range(40):  # 最大約40秒
+        r = requests.get(f"{AAI_BASE}/transcript/{tid}", headers=headers, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if data["status"] == "completed":
+            return data.get("text", "") or ""
+        if data["status"] == "error":
+            return ""
+        time.sleep(1)
+    return ""
+
+
+def translate_to_ja(client: OpenAI, model: str, text: str) -> str:
+    """英語などのテキストを自然な日本語に翻訳する（要約しない）。"""
+    if not text.strip():
+        return ""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system",
+                 "content": "入力テキストを、意味を変えず自然な日本語に翻訳するアシスタント。"
+                            "翻訳文のみを返し、注釈や原文は付けない。"},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=1000,
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
 # ----- LLM: 話者自動推定 -----
 def auto_map_speakers(client: OpenAI, model: str,
                       speakers: list[str], attendees: str,
@@ -785,7 +877,8 @@ ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
 ss.setdefault("sentiment", None)
 
-tab_rec, tab_up = st.tabs(["🎤 マイク録音", "📁 ファイルアップロード"])
+tab_rec, tab_up, tab_rt = st.tabs(
+    ["🎤 マイク録音", "📁 ファイルアップロード", "🌐 リアルタイム翻訳(実験)"])
 
 file_bytes = None
 audio_name = ""
@@ -893,6 +986,81 @@ with tab_up:
             file_bytes = raw_bytes
             st.audio(file_bytes)
             render_waveform(file_bytes, audio_name)
+
+with tab_rt:
+    st.caption("英語などの音声を、話しながら数秒遅れで日本語に翻訳して表示します（実験機能）。")
+    if not WEBRTC_AVAILABLE:
+        st.warning("この機能には streamlit-webrtc が必要です。requirements.txt に追加済みなので"
+                   "デプロイ後に利用できます。")
+    else:
+        rt_lang = st.selectbox(
+            "話す言語",
+            options=[("英語", "en"), ("日本語", "ja"), ("自動判定", "")],
+            format_func=lambda x: x[0],
+            key="rt_lang")[1]
+        st.caption("「START」を押してマイクを許可 → 話す。止めるには「STOP」。")
+
+        ss.setdefault("rt_log", [])
+        col_a, col_b = st.columns([1, 1])
+        with col_b:
+            if st.button("🗑 表示をクリア", key="rt_clear"):
+                ss.rt_log = []
+
+        webrtc_ctx = webrtc_streamer(
+            key="realtime-translate",
+            mode=WebRtcMode.SENDONLY,
+            audio_receiver_size=2048,
+            media_stream_constraints={"audio": True, "video": False},
+            rtc_configuration={"iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]}]},
+        )
+
+        output_box = st.empty()
+        if ss.rt_log:
+            output_box.markdown("### 📝 日本語訳\n\n" + "\n\n".join(ss.rt_log))
+
+        if webrtc_ctx.state.playing:
+            aai_key = get_aai_key()
+            client = get_llm_client(backend_name)
+            model = get_llm_model(backend_name)
+            status = st.empty()
+            chunk_seconds = 6
+            frame_buffer: list = []
+
+            while True:
+                if webrtc_ctx.audio_receiver:
+                    try:
+                        frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
+                    except queue.Empty:
+                        frames = []
+                else:
+                    break
+
+                frame_buffer.extend(frames)
+                # バッファ長（秒）を概算
+                total = sum(f.samples for f in frame_buffer) if frame_buffer else 0
+                rate = frame_buffer[0].sample_rate if frame_buffer else 48000
+                dur = total / rate if rate else 0
+
+                if dur >= chunk_seconds:
+                    status.caption("🔊 変換中...")
+                    wav = frames_to_wav_bytes(frame_buffer)
+                    frame_buffer = []
+                    if wav:
+                        try:
+                            url = aai_upload(aai_key, wav)
+                            en = aai_transcribe_quick(aai_key, url, rt_lang or "en")
+                            if en.strip():
+                                ja = translate_to_ja(client, model, en)
+                                if ja:
+                                    ss.rt_log.append(ja)
+                                    output_box.markdown(
+                                        "### 📝 日本語訳\n\n" + "\n\n".join(ss.rt_log))
+                        except Exception as e:
+                            status.caption(f"変換エラー: {e}")
+                    status.caption("🎤 録音中...")
+        else:
+            st.info("STARTを押すと翻訳が始まります。ページを開いたままにしてください。")
 
 # ステップ1: 文字起こし
 if file_bytes is not None:
