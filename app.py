@@ -1271,12 +1271,17 @@ with tab_vo:
             # 停止後: 全文の英語音声を生成して再生（タップで確実に鳴る）
             if not vo_ctx.state.playing:
                 if st.button("🔊 英語音声を生成して再生", key="vo_read"):
-                    mp3 = tts_english_bytes(" ".join(ss.vo_log))
-                    if mp3:
-                        with vo_speak:
-                            st.audio(mp3, format="audio/mp3", autoplay=True)
+                    if not GTTS_AVAILABLE:
+                        st.caption("gTTS未導入です（requirements.txt の反映＝再デプロイ待ちの可能性）。")
                     else:
-                        st.caption("音声生成に失敗しました（gTTS未導入の可能性）。")
+                        try:
+                            buf = io.BytesIO()
+                            gTTS(text=" ".join(ss.vo_log), lang="en").write_to_fp(buf)
+                            with vo_speak:
+                                st.audio(buf.getvalue(), format="audio/mp3",
+                                         autoplay=True)
+                        except Exception as e:
+                            st.caption(f"音声生成エラー: {e}")
 
         if vo_ctx.state.playing:
             aai_key = get_aai_key()
