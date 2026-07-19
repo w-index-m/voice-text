@@ -584,24 +584,22 @@ def translate_to_ja(client: OpenAI, model: str, text: str) -> str:
 
 
 def translate_to_en(client: OpenAI, model: str, text: str) -> str:
-    """日本語などのテキストを自然な英語に翻訳する（要約しない）。"""
+    """日本語などのテキストを自然な英語に翻訳する（要約しない）。
+    エラー時は例外を送出する（呼び出し側で内容を表示するため）。"""
     if not text.strip():
         return ""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system",
-                 "content": "Translate the input into natural English, preserving meaning. "
-                            "Return only the translation, no notes or original text."},
-                {"role": "user", "content": text},
-            ],
-            max_tokens=1000,
-            temperature=0.2,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system",
+             "content": "Translate the input into natural English, preserving meaning. "
+                        "Return only the translation, no notes or original text."},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=1000,
+        temperature=0.2,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 # ----- LLM: 話者自動推定 -----
