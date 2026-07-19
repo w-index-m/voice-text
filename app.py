@@ -598,6 +598,22 @@ def translate_to_en(client: OpenAI, model: str, text: str) -> str:
     return (resp.choices[0].message.content or "").strip()
 
 
+def is_noise_text(ja: str, en: str = "") -> bool:
+    """無音・雑音由来の無意味な文字起こし/翻訳を判定する。"""
+    j = ja.strip()
+    # 記号や極端に短い認識は雑音とみなす
+    if len(j) <= 1 or all(not ch.isalnum() for ch in j):
+        return True
+    e = en.strip().lower()
+    junk = [
+        "no input", "no text", "nothing to translate", "there is no",
+        "translate the", "翻訳する", "入力があり", "テキストがあり",
+    ]
+    if e and any(k in e for k in junk):
+        return True
+    return False
+
+
 def get_aai_llm_client() -> OpenAI | None:
     """AssemblyAI LLM Gateway(Claude)のOpenAI互換クライアント。キー未設定ならNone。"""
     key = st.secrets.get("ASSEMBLYAI_API_KEY") or os.environ.get("ASSEMBLYAI_API_KEY")
@@ -1195,8 +1211,21 @@ with tab_vo:
             + " 「START」→ マイク許可 → 日本語で話す。")
 
         ss.setdefault("vo_log", [])
-        if st.button("🗑 表示をクリア", key="vo_clear"):
-            ss.vo_log = []
+        vc1, vc2 = st.columns([1, 1])
+        with vc1:
+            # 音声アンロック（iOS Safari対策）: タップで音声再生を解錠
+            if st.button("🔓 音声を有効化(iOS)", key="vo_unlock"):
+                components.html(
+                    """<script>
+                    try{
+                      const u=new SpeechSynthesisUtterance(' ');
+                      u.volume=0; window.speechSynthesis.speak(u);
+                    }catch(e){}
+                    </script>""", height=0)
+                st.caption("音声を有効化しました。")
+        with vc2:
+            if st.button("🗑 表示をクリア", key="vo_clear"):
+                ss.vo_log = []
 
         vo_ctx = webrtc_streamer(
             key="voice-interpret",
@@ -1211,6 +1240,18 @@ with tab_vo:
         vo_speak = st.empty()
         if ss.vo_log:
             vo_box.markdown("### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
+            # 手動読み上げ（iOSでも確実に鳴る＝タップ操作のため）
+            if not vo_ctx.state.playing:
+                if st.button("🔊 最新の英語を読み上げ", key="vo_read"):
+                    components.html(
+                        f"""<script>
+                        try{{
+                          const u=new SpeechSynthesisUtterance({json.dumps(ss.vo_log[-1])});
+                          u.lang='en-US'; u.rate=1.0;
+                          window.speechSynthesis.cancel();
+                          window.speechSynthesis.speak(u);
+                        }}catch(e){{}}
+                        </script>""", height=0)
 
         if vo_ctx.state.playing:
             aai_key = get_aai_key()
@@ -1260,15 +1301,14 @@ with tab_vo:
                         else:
                             url = aai_upload(aai_key, wav)
                             ja = aai_transcribe_quick(aai_key, url, "ja")
-                        if not ja.strip():
+                        if not ja.strip() or is_noise_text(ja):
                             vo_debug.caption(
-                                f"🔇 音声が認識されませんでした（音量レベル={level:.4f}）"
-                                "／ レベルがほぼ0ならマイクが拾えていません")
+                                f"🔇 無音/雑音のためスキップ（音量レベル={level:.4f}）")
                             vo_status.caption("🎤 録音中...")
                             continue
                         en, note = translate_with_fallback(client, model, ja, "en")
-                        if not en:
-                            vo_debug.caption(f"認識: {ja} ／ ⚠️ 英訳失敗: {note}")
+                        if not en or is_noise_text(ja, en):
+                            vo_debug.caption(f"認識: {ja} ／ （雑音/翻訳不可のためスキップ）")
                             vo_status.caption("🎤 録音中...")
                             continue
                         vo_debug.caption(f"認識(日本語): {ja}{note}")
