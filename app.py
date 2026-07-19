@@ -497,6 +497,28 @@ def frames_to_wav_bytes(frames: list, target_rate: int = 16000) -> bytes | None:
         return None
 
 
+def get_groq_client() -> OpenAI | None:
+    """GroqのOpenAI互換クライアント。キー未設定ならNone。"""
+    key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+    if not key:
+        return None
+    return OpenAI(api_key=key, base_url="https://api.groq.com/openai/v1")
+
+
+def whisper_transcribe_bytes(groq_client: OpenAI, wav_bytes: bytes) -> str:
+    """Groq上のWhisper(large-v3)で文字起こし。言語自動判定・多言語混在に比較的強い。"""
+    try:
+        bio = io.BytesIO(wav_bytes)
+        bio.name = "audio.wav"
+        resp = groq_client.audio.transcriptions.create(
+            model="whisper-large-v3",
+            file=bio,
+        )
+        return (getattr(resp, "text", "") or "").strip()
+    except Exception:
+        return ""
+
+
 def aai_transcribe_quick(api_key: str, audio_url: str, language: str = "en") -> str:
     """話者分離なしの軽量な文字起こし（リアルタイム用・完了までポーリング）。"""
     headers = {"authorization": api_key}
@@ -993,11 +1015,28 @@ with tab_rt:
         st.warning("この機能には streamlit-webrtc が必要です。requirements.txt に追加済みなので"
                    "デプロイ後に利用できます。")
     else:
-        rt_lang = st.selectbox(
-            "話す言語",
-            options=[("英語", "en"), ("日本語", "ja"), ("自動判定", "")],
-            format_func=lambda x: x[0],
-            key="rt_lang")[1]
+        groq_ready = get_groq_client() is not None
+        engine_opts = ["AssemblyAI（単一言語・高精度）"]
+        if groq_ready:
+            engine_opts.insert(0, "Whisper via Groq（多言語混在対応）")
+        rt_engine = st.radio(
+            "文字起こしエンジン", engine_opts, key="rt_engine",
+            help="複数言語が混じる音声はWhisperが比較的得意です（GROQ_API_KEYが必要）。",
+        )
+        use_whisper = rt_engine.startswith("Whisper")
+        if not groq_ready:
+            st.caption("Whisper（多言語混在対応）を使うには GROQ_API_KEY をSecretに追加してください。")
+
+        if not use_whisper:
+            rt_lang = st.selectbox(
+                "話す言語",
+                options=[("英語", "en"), ("韓国語", "ko"), ("日本語", "ja"),
+                         ("自動判定", "")],
+                format_func=lambda x: x[0],
+                key="rt_lang")[1]
+        else:
+            rt_lang = ""  # Whisperは自動判定
+            st.caption("Whisperは言語を自動判定します（英語＋韓国語などの混在も可）。")
         st.caption("「START」を押してマイクを許可 → 話す。止めるには「STOP」。")
 
         ss.setdefault("rt_log", [])
@@ -1023,6 +1062,7 @@ with tab_rt:
             aai_key = get_aai_key()
             client = get_llm_client(backend_name)
             model = get_llm_model(backend_name)
+            groq_client = get_groq_client() if use_whisper else None
             status = st.empty()
             chunk_seconds = 6
             frame_buffer: list = []
@@ -1048,8 +1088,11 @@ with tab_rt:
                     frame_buffer = []
                     if wav:
                         try:
-                            url = aai_upload(aai_key, wav)
-                            en = aai_transcribe_quick(aai_key, url, rt_lang or "en")
+                            if use_whisper and groq_client is not None:
+                                en = whisper_transcribe_bytes(groq_client, wav)
+                            else:
+                                url = aai_upload(aai_key, wav)
+                                en = aai_transcribe_quick(aai_key, url, rt_lang or "en")
                             if en.strip():
                                 ja = translate_to_ja(client, model, en)
                                 if ja:
