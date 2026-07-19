@@ -1162,6 +1162,7 @@ with tab_vo:
             client = get_llm_client(backend_name)
             model = get_llm_model(backend_name)
             vo_status = st.empty()
+            vo_debug = st.empty()
             chunk_seconds = 5
             frame_buffer2: list = []
 
@@ -1183,33 +1184,42 @@ with tab_vo:
                     vo_status.caption("🔊 翻訳中...")
                     wav = frames_to_wav_bytes(frame_buffer2)
                     frame_buffer2 = []
-                    if wav:
-                        try:
-                            if vo_use_whisper:
-                                ja = whisper_transcribe_bytes(vo_groq, wav)
-                            else:
-                                url = aai_upload(aai_key, wav)
-                                ja = aai_transcribe_quick(aai_key, url, "ja")
-                            if ja.strip():
-                                en = translate_to_en(client, model, ja)
-                                if en:
-                                    ss.vo_log.append(en)
-                                    vo_box.markdown(
-                                        "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
-                                    # ブラウザTTSで英語読み上げ
-                                    safe = json.dumps(en)
-                                    with vo_speak:
-                                        components.html(
-                                            f"""<script>
-                                            try{{
-                                              const u=new SpeechSynthesisUtterance({safe});
-                                              u.lang='en-US'; u.rate=1.0;
-                                              window.speechSynthesis.cancel();
-                                              window.speechSynthesis.speak(u);
-                                            }}catch(e){{}}
-                                            </script>""", height=0)
-                        except Exception as e:
-                            vo_status.caption(f"エラー: {e}")
+                    if not wav:
+                        vo_debug.caption("⚠️ 音声データを取得できませんでした（マイク未接続の可能性）")
+                        continue
+                    try:
+                        if vo_use_whisper:
+                            ja = whisper_transcribe_bytes(vo_groq, wav)
+                        else:
+                            url = aai_upload(aai_key, wav)
+                            ja = aai_transcribe_quick(aai_key, url, "ja")
+                        if not ja.strip():
+                            vo_debug.caption("🔇 この区間では音声が認識されませんでした（無音/小声？）")
+                            vo_status.caption("🎤 録音中...")
+                            continue
+                        vo_debug.caption(f"認識(日本語): {ja}")
+                        en = translate_to_en(client, model, ja)
+                        if not en:
+                            vo_debug.caption(f"認識: {ja} ／ ⚠️ 英訳が空（翻訳エンジンを確認）")
+                            vo_status.caption("🎤 録音中...")
+                            continue
+                        ss.vo_log.append(en)
+                        vo_box.markdown(
+                            "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
+                        # ブラウザTTSで英語読み上げ
+                        safe = json.dumps(en)
+                        with vo_speak:
+                            components.html(
+                                f"""<script>
+                                try{{
+                                  const u=new SpeechSynthesisUtterance({safe});
+                                  u.lang='en-US'; u.rate=1.0;
+                                  window.speechSynthesis.cancel();
+                                  window.speechSynthesis.speak(u);
+                                }}catch(e){{}}
+                                </script>""", height=0)
+                    except Exception as e:
+                        vo_debug.caption(f"エラー: {e}")
                     vo_status.caption("🎤 録音中...")
         else:
             st.info("STARTを押すと通訳が始まります。端末の音量を上げておいてください。")
