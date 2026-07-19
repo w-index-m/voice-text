@@ -71,6 +71,17 @@ from openai import OpenAI
 
 VIDEO_EXTS = ["mp4", "mov", "avi", "mkv", "webm", "m4v"]
 
+# WebRTC用ICEサーバー（STUN + 無料公開TURNで接続成功率を上げる）
+RTC_ICE_CONFIG = {"iceServers": [
+    {"urls": ["stun:stun.l.google.com:19302"]},
+    {"urls": ["turn:openrelay.metered.ca:80"],
+     "username": "openrelayproject", "credential": "openrelayproject"},
+    {"urls": ["turn:openrelay.metered.ca:443"],
+     "username": "openrelayproject", "credential": "openrelayproject"},
+    {"urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+     "username": "openrelayproject", "credential": "openrelayproject"},
+]}
+
 AAI_BASE = "https://api.assemblyai.com/v2"
 
 LLM_BACKENDS = {
@@ -1171,8 +1182,7 @@ with tab_rt:
             mode=WebRtcMode.SENDONLY,
             audio_receiver_size=2048,
             media_stream_constraints={"audio": True, "video": False},
-            rtc_configuration={"iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]}]},
+            rtc_configuration=RTC_ICE_CONFIG,
         )
 
         output_box = st.empty()
@@ -1260,8 +1270,7 @@ with tab_vo:
             mode=WebRtcMode.SENDONLY,
             audio_receiver_size=2048,
             media_stream_constraints={"audio": True, "video": False},
-            rtc_configuration={"iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]}]},
+            rtc_configuration=RTC_ICE_CONFIG,
         )
 
         vo_box = st.empty()
