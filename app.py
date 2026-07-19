@@ -562,6 +562,27 @@ def translate_to_ja(client: OpenAI, model: str, text: str) -> str:
         return ""
 
 
+def translate_to_en(client: OpenAI, model: str, text: str) -> str:
+    """日本語などのテキストを自然な英語に翻訳する（要約しない）。"""
+    if not text.strip():
+        return ""
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system",
+                 "content": "Translate the input into natural English, preserving meaning. "
+                            "Return only the translation, no notes or original text."},
+                {"role": "user", "content": text},
+            ],
+            max_tokens=1000,
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
+
+
 # ----- LLM: 話者自動推定 -----
 def auto_map_speakers(client: OpenAI, model: str,
                       speakers: list[str], attendees: str,
@@ -899,8 +920,9 @@ ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
 ss.setdefault("sentiment", None)
 
-tab_rec, tab_up, tab_rt = st.tabs(
-    ["🎤 マイク録音", "📁 ファイルアップロード", "🌐 リアルタイム翻訳(実験)"])
+tab_rec, tab_up, tab_rt, tab_vo = st.tabs(
+    ["🎤 マイク録音", "📁 ファイルアップロード",
+     "🌐 リアルタイム翻訳(実験)", "🔊 日→英 音声通訳(実験)"])
 
 file_bytes = None
 audio_name = ""
@@ -1104,6 +1126,93 @@ with tab_rt:
                     status.caption("🎤 録音中...")
         else:
             st.info("STARTを押すと翻訳が始まります。ページを開いたままにしてください。")
+
+with tab_vo:
+    st.caption("日本語で話すと、数秒遅れで英語に翻訳し、英語音声で読み上げます（実験機能）。")
+    if not WEBRTC_AVAILABLE:
+        st.warning("この機能には streamlit-webrtc が必要です（デプロイ後に利用可能）。")
+    else:
+        vo_groq = get_groq_client()
+        vo_use_whisper = vo_groq is not None
+        st.caption(
+            ("文字起こしはWhisper(Groq)を使用します。" if vo_use_whisper
+             else "文字起こしはAssemblyAIを使用します。")
+            + " 「START」→ マイク許可 → 日本語で話す。")
+
+        ss.setdefault("vo_log", [])
+        if st.button("🗑 表示をクリア", key="vo_clear"):
+            ss.vo_log = []
+
+        vo_ctx = webrtc_streamer(
+            key="voice-interpret",
+            mode=WebRtcMode.SENDONLY,
+            audio_receiver_size=2048,
+            media_stream_constraints={"audio": True, "video": False},
+            rtc_configuration={"iceServers": [
+                {"urls": ["stun:stun.l.google.com:19302"]}]},
+        )
+
+        vo_box = st.empty()
+        vo_speak = st.empty()
+        if ss.vo_log:
+            vo_box.markdown("### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
+
+        if vo_ctx.state.playing:
+            aai_key = get_aai_key()
+            client = get_llm_client(backend_name)
+            model = get_llm_model(backend_name)
+            vo_status = st.empty()
+            chunk_seconds = 5
+            frame_buffer2: list = []
+
+            while True:
+                if vo_ctx.audio_receiver:
+                    try:
+                        frames = vo_ctx.audio_receiver.get_frames(timeout=1)
+                    except queue.Empty:
+                        frames = []
+                else:
+                    break
+
+                frame_buffer2.extend(frames)
+                total = sum(f.samples for f in frame_buffer2) if frame_buffer2 else 0
+                rate = frame_buffer2[0].sample_rate if frame_buffer2 else 48000
+                dur = total / rate if rate else 0
+
+                if dur >= chunk_seconds:
+                    vo_status.caption("🔊 翻訳中...")
+                    wav = frames_to_wav_bytes(frame_buffer2)
+                    frame_buffer2 = []
+                    if wav:
+                        try:
+                            if vo_use_whisper:
+                                ja = whisper_transcribe_bytes(vo_groq, wav)
+                            else:
+                                url = aai_upload(aai_key, wav)
+                                ja = aai_transcribe_quick(aai_key, url, "ja")
+                            if ja.strip():
+                                en = translate_to_en(client, model, ja)
+                                if en:
+                                    ss.vo_log.append(en)
+                                    vo_box.markdown(
+                                        "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
+                                    # ブラウザTTSで英語読み上げ
+                                    safe = json.dumps(en)
+                                    with vo_speak:
+                                        components.html(
+                                            f"""<script>
+                                            try{{
+                                              const u=new SpeechSynthesisUtterance({safe});
+                                              u.lang='en-US'; u.rate=1.0;
+                                              window.speechSynthesis.cancel();
+                                              window.speechSynthesis.speak(u);
+                                            }}catch(e){{}}
+                                            </script>""", height=0)
+                        except Exception as e:
+                            vo_status.caption(f"エラー: {e}")
+                    vo_status.caption("🎤 録音中...")
+        else:
+            st.info("STARTを押すと通訳が始まります。端末の音量を上げておいてください。")
 
 # ステップ1: 文字起こし
 if file_bytes is not None:
