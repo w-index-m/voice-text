@@ -563,29 +563,25 @@ def aai_transcribe_quick(api_key: str, audio_url: str, language: str = "en") -> 
 
 
 def translate_to_ja(client: OpenAI, model: str, text: str) -> str:
-    """英語などのテキストを自然な日本語に翻訳する（要約しない）。"""
+    """英語などのテキストを自然な日本語に翻訳する（要約しない）。エラー時は例外を送出。"""
     if not text.strip():
         return ""
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system",
-                 "content": "入力テキストを、意味を変えず自然な日本語に翻訳するアシスタント。"
-                            "翻訳文のみを返し、注釈や原文は付けない。"},
-                {"role": "user", "content": text},
-            ],
-            max_tokens=1000,
-            temperature=0.2,
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        return ""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system",
+             "content": "入力テキストを、意味を変えず自然な日本語に翻訳するアシスタント。"
+                        "翻訳文のみを返し、注釈や原文は付けない。"},
+            {"role": "user", "content": text},
+        ],
+        max_tokens=1000,
+        temperature=0.2,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def translate_to_en(client: OpenAI, model: str, text: str) -> str:
-    """日本語などのテキストを自然な英語に翻訳する（要約しない）。
-    エラー時は例外を送出する（呼び出し側で内容を表示するため）。"""
+    """日本語などのテキストを自然な英語に翻訳する（要約しない）。エラー時は例外を送出。"""
     if not text.strip():
         return ""
     resp = client.chat.completions.create(
@@ -600,6 +596,31 @@ def translate_to_en(client: OpenAI, model: str, text: str) -> str:
         temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
+
+
+def translate_with_fallback(client: OpenAI, model: str, text: str,
+                            direction: str) -> tuple[str, str]:
+    """翻訳を実行し、失敗/空ならGroqに自動フォールバックする。
+    戻り値: (翻訳結果, 使用エンジンの注記)。両方失敗なら ("", エラー内容)。"""
+    fn = translate_to_en if direction == "en" else translate_to_ja
+    err = ""
+    try:
+        out = fn(client, model, text)
+        if out.strip():
+            return out, ""
+        err = "主エンジンが空を返しました"
+    except Exception as e:
+        err = f"主エンジンエラー: {e}"
+    # Groqへフォールバック
+    gc = get_groq_client()
+    if gc is not None:
+        try:
+            out = fn(gc, "llama-3.3-70b-versatile", text)
+            if out.strip():
+                return out, "（Groqにフォールバック）"
+        except Exception as e:
+            return "", f"{err} / Groqも失敗: {e}"
+    return "", f"{err}（GroqキーGROQ_API_KEY未設定でフォールバック不可）"
 
 
 # ----- LLM: 話者自動推定 -----
@@ -1135,7 +1156,7 @@ with tab_rt:
                                 url = aai_upload(aai_key, wav)
                                 en = aai_transcribe_quick(aai_key, url, rt_lang or "en")
                             if en.strip():
-                                ja = translate_to_ja(client, model, en)
+                                ja, _ = translate_with_fallback(client, model, en, "ja")
                                 if ja:
                                     ss.rt_log.append(ja)
                                     output_box.markdown(
@@ -1230,12 +1251,12 @@ with tab_vo:
                                 "／ レベルがほぼ0ならマイクが拾えていません")
                             vo_status.caption("🎤 録音中...")
                             continue
-                        vo_debug.caption(f"認識(日本語): {ja} （音量レベル={level:.4f}）")
-                        en = translate_to_en(client, model, ja)
+                        en, note = translate_with_fallback(client, model, ja, "en")
                         if not en:
-                            vo_debug.caption(f"認識: {ja} ／ ⚠️ 英訳が空（翻訳エンジンを確認）")
+                            vo_debug.caption(f"認識: {ja} ／ ⚠️ 英訳失敗: {note}")
                             vo_status.caption("🎤 録音中...")
                             continue
+                        vo_debug.caption(f"認識(日本語): {ja}{note}")
                         ss.vo_log.append(en)
                         vo_box.markdown(
                             "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
