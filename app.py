@@ -1182,6 +1182,18 @@ with tab_vo:
 
                 if dur >= chunk_seconds:
                     vo_status.caption("🔊 翻訳中...")
+                    # 取得音声の音量レベルを算出（0に近い=拾えていない）
+                    try:
+                        levels = []
+                        for f in frame_buffer2:
+                            a = f.to_ndarray().astype(np.float32).flatten()
+                            if a.size:
+                                if np.max(np.abs(a)) > 1.5:
+                                    a = a / 32768.0
+                                levels.append(float(np.sqrt(np.mean(a ** 2))))
+                        level = max(levels) if levels else 0.0
+                    except Exception:
+                        level = -1.0
                     wav = frames_to_wav_bytes(frame_buffer2)
                     frame_buffer2 = []
                     if not wav:
@@ -1194,10 +1206,12 @@ with tab_vo:
                             url = aai_upload(aai_key, wav)
                             ja = aai_transcribe_quick(aai_key, url, "ja")
                         if not ja.strip():
-                            vo_debug.caption("🔇 この区間では音声が認識されませんでした（無音/小声？）")
+                            vo_debug.caption(
+                                f"🔇 音声が認識されませんでした（音量レベル={level:.4f}）"
+                                "／ レベルがほぼ0ならマイクが拾えていません")
                             vo_status.caption("🎤 録音中...")
                             continue
-                        vo_debug.caption(f"認識(日本語): {ja}")
+                        vo_debug.caption(f"認識(日本語): {ja} （音量レベル={level:.4f}）")
                         en = translate_to_en(client, model, ja)
                         if not en:
                             vo_debug.caption(f"認識: {ja} ／ ⚠️ 英訳が空（翻訳エンジンを確認）")
