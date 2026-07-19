@@ -457,44 +457,65 @@ def build_diarized_text(data: dict, name_map: dict | None = None) -> str:
 
 # ----- リアルタイム翻訳（実験）用ヘルパー -----
 def frames_to_wav_bytes(frames: list, target_rate: int = 16000) -> bytes | None:
-    """streamlit-webrtc の音声フレーム列を16kHzモノラルWAVバイト列に変換する。"""
+    """streamlit-webrtc の音声フレーム列を16kHzモノラル16bit WAVに変換する。
+    PyAVのリサンプラーでフォーマット/チャンネルを正しく揃える。"""
     import wave
     if not frames:
         return None
     try:
-        chunks = []
-        src_rate = None
+        import av
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=target_rate)
+        pcm = bytearray()
         for f in frames:
-            arr = f.to_ndarray()
-            src_rate = f.sample_rate
-            if arr.ndim == 2:  # (channels, samples) → モノラル化
-                arr = arr.mean(axis=0)
-            arr = arr.flatten().astype(np.float32)
-            # 整数型なら-1..1へ正規化
-            if np.max(np.abs(arr)) > 1.5:
-                arr = arr / 32768.0
-            chunks.append(arr)
-        if not chunks or not src_rate:
+            out = resampler.resample(f)
+            # PyAVのバージョンにより単一フレーム/リストのどちらも返り得る
+            if not isinstance(out, list):
+                out = [out] if out is not None else []
+            for rf in out:
+                pcm += bytes(rf.planes[0])
+        if not pcm:
             return None
-        samples = np.concatenate(chunks)
-        # 16kHzへ簡易リサンプル
-        if src_rate != target_rate:
-            n = int(len(samples) * target_rate / src_rate)
-            if n <= 0:
-                return None
-            samples = np.interp(
-                np.linspace(0, len(samples) - 1, n),
-                np.arange(len(samples)), samples)
-        pcm = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as w:
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(target_rate)
-            w.writeframes(pcm.tobytes())
+            w.writeframes(bytes(pcm))
         return buf.getvalue()
     except Exception:
-        return None
+        # フォールバック: 手動変換（フォーマット依存で崩れる可能性あり）
+        try:
+            chunks = []
+            src_rate = None
+            for f in frames:
+                arr = f.to_ndarray()
+                src_rate = f.sample_rate
+                if arr.ndim == 2:
+                    arr = arr.mean(axis=0)
+                arr = arr.flatten().astype(np.float32)
+                if np.max(np.abs(arr)) > 1.5:
+                    arr = arr / 32768.0
+                chunks.append(arr)
+            if not chunks or not src_rate:
+                return None
+            samples = np.concatenate(chunks)
+            if src_rate != target_rate:
+                n = int(len(samples) * target_rate / src_rate)
+                if n <= 0:
+                    return None
+                samples = np.interp(
+                    np.linspace(0, len(samples) - 1, n),
+                    np.arange(len(samples)), samples)
+            pcm2 = np.clip(samples * 32767, -32768, 32767).astype(np.int16)
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(target_rate)
+                w.writeframes(pcm2.tobytes())
+            return buf.getvalue()
+        except Exception:
+            return None
 
 
 def get_groq_client() -> OpenAI | None:
