@@ -641,16 +641,24 @@ def is_noise_text(ja: str, en: str = "") -> bool:
     return False
 
 
-def tts_english_bytes(text: str) -> bytes | None:
-    """英語テキストをmp3音声に変換（gTTS・無料）。失敗時None。"""
+def tts_bytes(text: str, lang: str = "en") -> bytes | None:
+    """テキストをmp3音声に変換（gTTS・無料）。lang: en/ja など。失敗時None。"""
     if not GTTS_AVAILABLE or not text.strip():
         return None
     try:
         buf = io.BytesIO()
-        gTTS(text=text, lang="en").write_to_fp(buf)
+        gTTS(text=text, lang=lang).write_to_fp(buf)
         return buf.getvalue()
     except Exception:
         return None
+
+
+def is_japanese_text(text: str) -> bool:
+    """ひらがな/カタカナ/漢字を含めば日本語とみなす。"""
+    for c in text:
+        if ("぀" <= c <= "ヿ") or ("一" <= c <= "鿿"):
+            return True
+    return False
 
 
 def get_aai_llm_client() -> OpenAI | None:
@@ -659,6 +667,28 @@ def get_aai_llm_client() -> OpenAI | None:
     if not key:
         return None
     return OpenAI(api_key=key, base_url="https://llm-gateway.assemblyai.com/v1")
+
+
+def translate_document(client: OpenAI, model: str, text: str,
+                       target_lang: str) -> str:
+    """議事録などの長文Markdownを、構造を保ったまま翻訳する。target_lang: en/ja。"""
+    if not text.strip():
+        return ""
+    if target_lang == "en":
+        sys_msg = ("You are a professional translator. Translate the Markdown document "
+                   "into natural English, preserving all Markdown structure (headings, "
+                   "lists, tables). Output only the translated Markdown.")
+    else:
+        sys_msg = ("あなたはプロの翻訳者です。Markdown文書を、見出し・箇条書き・表などの"
+                   "構造を保ったまま自然な日本語に翻訳してください。訳文のMarkdownのみ出力。")
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": sys_msg},
+                  {"role": "user", "content": text}],
+        max_tokens=8000,
+        temperature=0.3,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 
 def translate_with_fallback(client: OpenAI, model: str, text: str,
@@ -1032,7 +1062,7 @@ ss.setdefault("sentiment", None)
 
 tab_rec, tab_up, tab_rt, tab_vo = st.tabs(
     ["🎤 マイク録音", "📁 ファイルアップロード",
-     "🌐 リアルタイム翻訳(実験)", "🔊 日→英 音声通訳(実験)"])
+     "🌐 リアルタイム翻訳(実験)", "🔊 音声通訳 日英(実験)"])
 
 file_bytes = None
 audio_name = ""
@@ -1237,7 +1267,7 @@ with tab_rt:
             st.info("STARTを押すと翻訳が始まります。ページを開いたままにしてください。")
 
 with tab_vo:
-    st.caption("日本語で話すと、数秒遅れで英語に翻訳し、英語音声で読み上げます（実験機能）。")
+    st.caption("話すと数秒遅れで翻訳し、訳文を音声で読み上げます（日英・双方向対応・実験機能）。")
     if not WEBRTC_AVAILABLE:
         st.warning("この機能には streamlit-webrtc が必要です（デプロイ後に利用可能）。")
     else:
@@ -1246,7 +1276,14 @@ with tab_vo:
         st.caption(
             ("文字起こしはWhisper(Groq)を使用します。" if vo_use_whisper
              else "文字起こしはAssemblyAIを使用します。")
-            + " 「START」→ マイク許可 → 日本語で話す。")
+            + " 「START」→ マイク許可 → 話す。")
+
+        vo_dir = st.radio(
+            "通訳方向",
+            ["自動（双方向）", "日本語 → 英語", "英語 → 日本語"],
+            horizontal=True, key="vo_dir",
+            help="「自動」は話した言語を判定し、もう一方の言語に訳します（会話通訳）。",
+        )
 
         ss.setdefault("vo_log", [])
         if st.button("🗑 表示をクリア", key="vo_clear"):
@@ -1264,16 +1301,20 @@ with tab_vo:
         vo_box = st.empty()
         vo_speak = st.empty()
         if ss.vo_log:
-            vo_box.markdown("### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
-            # 停止後: 全文の英語音声を生成して再生（タップで確実に鳴る）
+            vo_box.markdown("### 🔊 通訳結果\n\n" + "\n\n".join(ss.vo_log))
+            # 停止後: 最新の訳文を音声再生（タップで確実に鳴る）
             if not vo_ctx.state.playing:
-                if st.button("🔊 英語音声を生成して再生", key="vo_read"):
+                if st.button("🔊 最新の訳を音声で再生", key="vo_read"):
                     if not GTTS_AVAILABLE:
-                        st.caption("gTTS未導入です（requirements.txt の反映＝再デプロイ待ちの可能性）。")
+                        st.caption("gTTS未導入です（再デプロイ待ちの可能性）。")
                     else:
                         try:
+                            last = ss.vo_log[-1]
+                            # [English]/[日本語] のタグから言語を判定
+                            lang = "ja" if last.startswith("[日本語]") else "en"
+                            body = last.split("] ", 1)[-1]
                             buf = io.BytesIO()
-                            gTTS(text=" ".join(ss.vo_log), lang="en").write_to_fp(buf)
+                            gTTS(text=body, lang=lang).write_to_fp(buf)
                             with vo_speak:
                                 st.audio(buf.getvalue(), format="audio/mp3",
                                          autoplay=True)
@@ -1328,27 +1369,37 @@ with tab_vo:
                         vo_debug.caption("⚠️ 音声データを取得できませんでした（マイク未接続の可能性）")
                         continue
                     try:
+                        # AssemblyAI利用時は方向から入力言語を決める（Whisperは自動判定）
+                        aai_lang = "en" if vo_dir.startswith("英語") else "ja"
                         if vo_use_whisper:
-                            ja = whisper_transcribe_bytes(vo_groq, wav)
+                            src = whisper_transcribe_bytes(vo_groq, wav)
                         else:
                             url = aai_upload(aai_key, wav)
-                            ja = aai_transcribe_quick(aai_key, url, "ja")
-                        if not ja.strip() or is_noise_text(ja):
+                            src = aai_transcribe_quick(aai_key, url, aai_lang)
+                        if not src.strip() or is_noise_text(src):
                             vo_debug.caption(
                                 f"🔇 無音/雑音のためスキップ（音量レベル={level:.4f}）")
                             vo_status.caption("🎤 録音中...")
                             continue
-                        en, note = translate_with_fallback(client, model, ja, "en")
-                        if not en or is_noise_text(ja, en):
-                            vo_debug.caption(f"認識: {ja} ／ （雑音/翻訳不可のためスキップ）")
+                        # 翻訳方向を決定
+                        if vo_dir == "日本語 → 英語":
+                            target = "en"
+                        elif vo_dir == "英語 → 日本語":
+                            target = "ja"
+                        else:  # 自動（双方向）: 話した言語の逆へ
+                            target = "en" if is_japanese_text(src) else "ja"
+                        out, note = translate_with_fallback(client, model, src, target)
+                        if not out or is_noise_text(src, out):
+                            vo_debug.caption(f"認識: {src} ／ （雑音/翻訳不可のためスキップ）")
                             vo_status.caption("🎤 録音中...")
                             continue
-                        vo_debug.caption(f"認識(日本語): {ja}{note}")
-                        ss.vo_log.append(en)
+                        vo_debug.caption(f"認識: {src}{note}")
+                        head = "English" if target == "en" else "日本語"
+                        ss.vo_log.append(f"[{head}] {out}")
                         vo_box.markdown(
-                            "### 🔊 English\n\n" + "\n\n".join(ss.vo_log))
-                        # 英語音声(mp3)を生成して再生（gTTS・ブラウザ非依存で確実）
-                        mp3 = tts_english_bytes(en)
+                            "### 🔊 通訳結果\n\n" + "\n\n".join(ss.vo_log))
+                        # 訳文の言語で音声生成して再生
+                        mp3 = tts_bytes(out, lang=target)
                         if mp3:
                             with vo_speak:
                                 st.audio(mp3, format="audio/mp3", autoplay=True)
@@ -1478,6 +1529,7 @@ if ss.aai_data is not None:
         ss.minutes_edited = minutes
         ss["todos"] = todos
         ss["sentiment"] = None  # 温度感は別ボタンで生成
+        ss["minutes_translated"] = None  # 翻訳版もリセット
 
     # 議事録表示＆編集
     if ss.get("minutes_edited") is not None:
@@ -1497,6 +1549,34 @@ if ss.aai_data is not None:
             if edited != ss.minutes_edited:
                 ss.minutes_edited = edited
                 st.rerun()
+
+        # 議事録の翻訳（日本語⇄英語）
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            do_en = st.button("🌐 英語に翻訳", key="tr_min_en")
+        with tcol2:
+            do_ja = st.button("🌐 日本語に翻訳", key="tr_min_ja")
+        if do_en or do_ja:
+            tgt = "en" if do_en else "ja"
+            tclient = get_llm_client(backend_name)
+            tmodel = get_llm_model(backend_name)
+            with st.spinner("議事録を翻訳中..."):
+                try:
+                    ss["minutes_translated"] = translate_document(
+                        tclient, tmodel, ss.minutes_edited, tgt)
+                    ss["minutes_translated_lang"] = tgt
+                except Exception as e:
+                    st.error(f"翻訳失敗: {e}")
+        if ss.get("minutes_translated"):
+            lang_label = "英語" if ss.get("minutes_translated_lang") == "en" else "日本語"
+            st.subheader(f"🌐 翻訳版（{lang_label}）")
+            st.markdown(ss["minutes_translated"])
+            _base = os.path.splitext(ss.get("audio_name", "議事録"))[0]
+            st.download_button(
+                f"翻訳版（{lang_label}）.md",
+                ss["minutes_translated"].encode("utf-8"),
+                file_name=f"{_base}_翻訳_{lang_label}.md",
+                mime="text/markdown", key="dl_min_tr")
 
         todos = ss.get("todos", [])
         if todos:
