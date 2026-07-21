@@ -669,6 +669,28 @@ def get_aai_llm_client() -> OpenAI | None:
     return OpenAI(api_key=key, base_url="https://llm-gateway.assemblyai.com/v1")
 
 
+def translate_document(client: OpenAI, model: str, text: str,
+                       target_lang: str) -> str:
+    """議事録などの長文Markdownを、構造を保ったまま翻訳する。target_lang: en/ja。"""
+    if not text.strip():
+        return ""
+    if target_lang == "en":
+        sys_msg = ("You are a professional translator. Translate the Markdown document "
+                   "into natural English, preserving all Markdown structure (headings, "
+                   "lists, tables). Output only the translated Markdown.")
+    else:
+        sys_msg = ("あなたはプロの翻訳者です。Markdown文書を、見出し・箇条書き・表などの"
+                   "構造を保ったまま自然な日本語に翻訳してください。訳文のMarkdownのみ出力。")
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": sys_msg},
+                  {"role": "user", "content": text}],
+        max_tokens=8000,
+        temperature=0.3,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 def translate_with_fallback(client: OpenAI, model: str, text: str,
                             direction: str) -> tuple[str, str]:
     """翻訳を実行し、失敗/空なら Groq → AssemblyAI(Claude) の順に自動フォールバック。
@@ -1507,6 +1529,7 @@ if ss.aai_data is not None:
         ss.minutes_edited = minutes
         ss["todos"] = todos
         ss["sentiment"] = None  # 温度感は別ボタンで生成
+        ss["minutes_translated"] = None  # 翻訳版もリセット
 
     # 議事録表示＆編集
     if ss.get("minutes_edited") is not None:
@@ -1526,6 +1549,34 @@ if ss.aai_data is not None:
             if edited != ss.minutes_edited:
                 ss.minutes_edited = edited
                 st.rerun()
+
+        # 議事録の翻訳（日本語⇄英語）
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            do_en = st.button("🌐 英語に翻訳", key="tr_min_en")
+        with tcol2:
+            do_ja = st.button("🌐 日本語に翻訳", key="tr_min_ja")
+        if do_en or do_ja:
+            tgt = "en" if do_en else "ja"
+            tclient = get_llm_client(backend_name)
+            tmodel = get_llm_model(backend_name)
+            with st.spinner("議事録を翻訳中..."):
+                try:
+                    ss["minutes_translated"] = translate_document(
+                        tclient, tmodel, ss.minutes_edited, tgt)
+                    ss["minutes_translated_lang"] = tgt
+                except Exception as e:
+                    st.error(f"翻訳失敗: {e}")
+        if ss.get("minutes_translated"):
+            lang_label = "英語" if ss.get("minutes_translated_lang") == "en" else "日本語"
+            st.subheader(f"🌐 翻訳版（{lang_label}）")
+            st.markdown(ss["minutes_translated"])
+            _base = os.path.splitext(ss.get("audio_name", "議事録"))[0]
+            st.download_button(
+                f"翻訳版（{lang_label}）.md",
+                ss["minutes_translated"].encode("utf-8"),
+                file_name=f"{_base}_翻訳_{lang_label}.md",
+                mime="text/markdown", key="dl_min_tr")
 
         todos = ss.get("todos", [])
         if todos:
