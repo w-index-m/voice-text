@@ -1172,11 +1172,18 @@ with tab_up:
             render_waveform(file_bytes, audio_name)
 
 with tab_rt:
-    st.caption("英語などの音声を、話しながら数秒遅れで日本語に翻訳して表示します（実験機能）。")
+    st.caption("話しながら数秒遅れで翻訳して表示します（日本語⇄英語など・実験機能）。")
     if not WEBRTC_AVAILABLE:
         st.warning("この機能には streamlit-webrtc が必要です。requirements.txt に追加済みなので"
                    "デプロイ後に利用できます。")
     else:
+        rt_dir = st.radio(
+            "翻訳方向",
+            ["自動（双方向）", "英語 → 日本語", "日本語 → 英語"],
+            horizontal=True, key="rt_dir",
+            help="「自動」は話した言語を判定し、もう一方の言語に訳します。",
+        )
+
         groq_ready = get_groq_client() is not None
         engine_opts = ["AssemblyAI（単一言語・高精度）"]
         if groq_ready:
@@ -1190,12 +1197,12 @@ with tab_rt:
             st.caption("Whisper（多言語混在対応）を使うには GROQ_API_KEY をSecretに追加してください。")
 
         if not use_whisper:
-            rt_lang = st.selectbox(
-                "話す言語",
-                options=[("英語", "en"), ("韓国語", "ko"), ("日本語", "ja"),
-                         ("自動判定", "")],
-                format_func=lambda x: x[0],
-                key="rt_lang")[1]
+            if rt_dir == "日本語 → 英語":
+                rt_lang = "ja"
+            elif rt_dir == "英語 → 日本語":
+                rt_lang = "en"
+            else:
+                rt_lang = ""  # 自動判定
         else:
             rt_lang = ""  # Whisperは自動判定
             st.caption("Whisperは言語を自動判定します（英語＋韓国語などの混在も可）。")
@@ -1217,7 +1224,7 @@ with tab_rt:
 
         output_box = st.empty()
         if ss.rt_log:
-            output_box.markdown("### 📝 日本語訳\n\n" + "\n\n".join(ss.rt_log))
+            output_box.markdown("### 📝 翻訳結果\n\n" + "\n\n".join(ss.rt_log))
 
         if webrtc_ctx.state.playing:
             aai_key = get_aai_key()
@@ -1250,16 +1257,25 @@ with tab_rt:
                     if wav:
                         try:
                             if use_whisper and groq_client is not None:
-                                en = whisper_transcribe_bytes(groq_client, wav)
+                                src = whisper_transcribe_bytes(groq_client, wav)
                             else:
+                                # AssemblyAI利用時は方向から文字起こし言語を決める
+                                aai_lang = rt_lang or "en"
                                 url = aai_upload(aai_key, wav)
-                                en = aai_transcribe_quick(aai_key, url, rt_lang or "en")
-                            if en.strip():
-                                ja, _ = translate_with_fallback(client, model, en, "ja")
-                                if ja:
-                                    ss.rt_log.append(ja)
+                                src = aai_transcribe_quick(aai_key, url, aai_lang)
+                            if src.strip() and not is_noise_text(src):
+                                if rt_dir == "日本語 → 英語":
+                                    target = "en"
+                                elif rt_dir == "英語 → 日本語":
+                                    target = "ja"
+                                else:  # 自動（双方向）
+                                    target = "en" if is_japanese_text(src) else "ja"
+                                out, _ = translate_with_fallback(client, model, src, target)
+                                if out and not is_noise_text(src, out):
+                                    head = "English" if target == "en" else "日本語"
+                                    ss.rt_log.append(f"[{head}] {out}")
                                     output_box.markdown(
-                                        "### 📝 日本語訳\n\n" + "\n\n".join(ss.rt_log))
+                                        "### 📝 翻訳結果\n\n" + "\n\n".join(ss.rt_log))
                         except Exception as e:
                             status.caption(f"変換エラー: {e}")
                     status.caption("🎤 録音中...")
