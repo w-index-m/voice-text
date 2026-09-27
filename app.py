@@ -472,6 +472,31 @@ def build_diarized_text(data: dict, name_map: dict | None = None) -> str:
     return "\n".join(lines)
 
 
+def compute_speaker_talk_time(data: dict, name_map: dict | None = None) -> list[dict]:
+    """話者ごとの発言時間(秒)と割合を集計する。utterancesのstart/end(ms)を利用。"""
+    utterances = data.get("utterances") or []
+    if not utterances:
+        return []
+    name_map = name_map or {}
+    totals: dict[str, float] = {}
+    for u in utterances:
+        label = u["speaker"]
+        dur = max(0.0, (u.get("end", 0) - u.get("start", 0)) / 1000.0)
+        totals[label] = totals.get(label, 0.0) + dur
+    grand_total = sum(totals.values())
+    if grand_total <= 0:
+        return []
+    rows = []
+    for label, secs in sorted(totals.items(), key=lambda x: -x[1]):
+        display = name_map.get(label) or f"話者{label}"
+        rows.append({
+            "話者": display,
+            "発言時間(秒)": round(secs, 1),
+            "割合(%)": round(secs / grand_total * 100, 1),
+        })
+    return rows
+
+
 # ----- リアルタイム翻訳（実験）用ヘルパー -----
 def frames_to_wav_bytes(frames: list, target_rate: int = 16000) -> bytes | None:
     """streamlit-webrtc の音声フレーム列を16kHzモノラル16bit WAVに変換する。
@@ -1511,6 +1536,36 @@ if ss.aai_data is not None:
                                          placeholder=f"話者{sp}")
 
     diarized = build_diarized_text(ss.aai_data, name_map)
+
+    talk_time = compute_speaker_talk_time(ss.aai_data, name_map)
+    if talk_time:
+        with st.expander("📊 話者ごとの発言時間", expanded=False):
+            palette = ["#6366f1", "#22c55e", "#eab308", "#ef4444",
+                      "#06b6d4", "#a855f7", "#f97316", "#84cc16"]
+            fig, ax = plt.subplots(figsize=(6, 0.6 * len(talk_time) + 0.5))
+            fig.patch.set_alpha(0)
+            ax.set_facecolor("none")
+            names = [r["話者"] for r in talk_time][::-1]
+            secs = [r["発言時間(秒)"] for r in talk_time][::-1]
+            colors = [palette[i % len(palette)]
+                     for i in range(len(talk_time))][::-1]
+            bars = ax.barh(names, secs, color=colors, height=0.6)
+            for bar, row in zip(bars, talk_time[::-1]):
+                ax.text(bar.get_width() + max(secs) * 0.02,
+                       bar.get_y() + bar.get_height() / 2,
+                       f"{row['発言時間(秒)']:.0f}秒 ({row['割合(%)']:.0f}%)",
+                       va="center", fontsize=9, color="#ddd")
+            ax.set_xlabel("発言時間(秒)", color="#aaa", fontsize=9)
+            ax.tick_params(colors="#ddd")
+            for spine in ["top", "right"]:
+                ax.spines[spine].set_visible(False)
+            for spine in ["left", "bottom"]:
+                ax.spines[spine].set_color("#555")
+            ax.set_xlim(0, max(secs) * 1.25)
+            fig.tight_layout()
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+            st.dataframe(talk_time, use_container_width=True, hide_index=True)
 
     if show_transcript:
         with st.expander("話者分離テキスト全文", expanded=False):
