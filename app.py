@@ -686,6 +686,113 @@ def is_japanese_text(text: str) -> bool:
     return False
 
 
+def split_text_chunks(text: str, max_chars: int = 1800) -> list[str]:
+    """長文を文末区切り（。/./!/?/改行）を優先しつつmax_chars以下のチャンクに分割する。"""
+    seps = "。．！？!?\n"
+    chunks: list[str] = []
+    buf = ""
+    for ch in text:
+        buf += ch
+        if len(buf) >= max_chars and ch in seps:
+            chunks.append(buf.strip())
+            buf = ""
+        elif len(buf) >= max_chars * 1.3:  # 区切りが長く来ない場合の保険
+            chunks.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        chunks.append(buf.strip())
+    return [c for c in chunks if c]
+
+
+def translate_long_text(client: OpenAI, model: str, text: str,
+                        target_lang: str, progress_cb=None) -> str:
+    """長文をチャンク分割し、省略せず全文を翻訳して結合する。"""
+    chunks = split_text_chunks(text, max_chars=1800)
+    out_parts = []
+    for i, chunk in enumerate(chunks):
+        out, _ = translate_with_fallback(client, model, chunk, target_lang)
+        out_parts.append(out or chunk)
+        if progress_cb:
+            progress_cb((i + 1) / len(chunks))
+    return "\n".join(out_parts)
+
+
+def synthesize_long_speech(text: str, lang: str = "ja",
+                           progress_cb=None) -> bytes | None:
+    """長文を分割してgTTSで音声化し、1本のmp3に連結する。"""
+    chunks = split_text_chunks(text, max_chars=400)
+    if not chunks:
+        return None
+    mp3_parts: list[bytes] = []
+    for i, chunk in enumerate(chunks):
+        mp3 = tts_bytes(chunk, lang=lang)
+        if mp3:
+            mp3_parts.append(mp3)
+        if progress_cb:
+            progress_cb((i + 1) / len(chunks))
+    if not mp3_parts:
+        return None
+    if len(mp3_parts) == 1 or not FFMPEG_AVAILABLE:
+        return b"".join(mp3_parts)
+    # ffmpegのconcatデマルチプレクサで安全に連結
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        tmp_paths = []
+        for part in mp3_parts:
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(part)
+                tmp_paths.append(f.name)
+        list_path = tmp_paths[0] + "_list.txt"
+        with open(list_path, "w") as f:
+            for p in tmp_paths:
+                f.write(f"file '{p}'\n")
+        out_path = tmp_paths[0] + "_out.mp3"
+        cmd = [ffmpeg_exe, "-y", "-f", "concat", "-safe", "0",
+               "-i", list_path, "-c", "copy", out_path]
+        subprocess.run(cmd, check=True, capture_output=True)
+        with open(out_path, "rb") as f:
+            result = f.read()
+        for p in tmp_paths + [list_path, out_path]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        return result
+    except Exception:
+        return b"".join(mp3_parts)  # 失敗時は単純連結にフォールバック
+
+
+def mux_video_with_audio(video_bytes: bytes, audio_mp3_bytes: bytes,
+                         suffix: str = ".mp4") -> bytes:
+    """動画の音声トラックを別の音声(mp3)に差し替える。"""
+    if not FFMPEG_AVAILABLE:
+        raise RuntimeError("動画生成には imageio_ffmpeg が必要です。")
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as vf:
+        vf.write(video_bytes)
+        video_path = vf.name
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as af:
+        af.write(audio_mp3_bytes)
+        audio_path = af.name
+    out_path = video_path + "_dubbed.mp4"
+    try:
+        cmd = [ffmpeg_exe, "-y", "-i", video_path, "-i", audio_path,
+               "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+               "-shortest", out_path]
+        subprocess.run(cmd, check=True, capture_output=True)
+        with open(out_path, "rb") as f:
+            return f.read()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"音声差し替えに失敗しました: {e.stderr.decode(errors='ignore')[:300]}")
+    finally:
+        for p in (video_path, audio_path, out_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def get_aai_llm_client() -> OpenAI | None:
     """AssemblyAI LLM Gateway(Claude)のOpenAI互換クライアント。キー未設定ならNone。"""
     key = st.secrets.get("ASSEMBLYAI_API_KEY") or os.environ.get("ASSEMBLYAI_API_KEY")
@@ -1085,9 +1192,9 @@ ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
 ss.setdefault("sentiment", None)
 
-tab_rec, tab_up, tab_live, tab_rt, tab_vo = st.tabs(
-    ["🎤 マイク録音", "📁 ファイルアップロード", "📝 ライブ文字起こし(実験)",
-     "🌐 リアルタイム翻訳(実験)", "🔊 音声通訳 日英(実験)"])
+tab_rec, tab_up, tab_dub, tab_live, tab_rt, tab_vo = st.tabs(
+    ["🎤 マイク録音", "📁 ファイルアップロード", "🎬 日本語吹き替え生成(実験)",
+     "📝 ライブ文字起こし(実験)", "🌐 リアルタイム翻訳(実験)", "🔊 音声通訳 日英(実験)"])
 
 file_bytes = None
 audio_name = ""
@@ -1195,6 +1302,128 @@ with tab_up:
             file_bytes = raw_bytes
             st.audio(file_bytes)
             render_waveform(file_bytes, audio_name)
+
+with tab_dub:
+    st.caption(
+        "英語などの音声・動画講演を、文字起こし→全文翻訳→日本語音声化まで通しで行います"
+        "（実験機能）。動画の場合は音声を日本語に差し替えた動画も生成できます。"
+    )
+    st.info(
+        "⚠️ 生成される日本語音声は元の話速・間（ま）に完全同期しません"
+        "（リップシンクではなくナレーション的な吹き替えです）。長い講演は処理に数分かかります。",
+        icon="ℹ️",
+    )
+
+    dub_uploaded = st.file_uploader(
+        "英語などの音声・動画ファイルをアップロード",
+        type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"]
+        + VIDEO_EXTS,
+        key="dub_uploader",
+    )
+    dub_lang = st.selectbox(
+        "元の音声の言語", options=[("英語", "en"), ("自動判定", ""), ("日本語", "ja")],
+        format_func=lambda x: x[0], key="dub_src_lang")[1]
+
+    ss.setdefault("dub_result", None)
+
+    if dub_uploaded is not None:
+        dub_raw = dub_uploaded.getvalue()
+        dub_ext = os.path.splitext(dub_uploaded.name)[1].lower().lstrip(".")
+        dub_is_video = dub_ext in VIDEO_EXTS
+        st.info(f"ファイル: {dub_uploaded.name} / {len(dub_raw)/1024/1024:.1f} MB"
+               + ("（動画）" if dub_is_video else ""))
+        if dub_is_video:
+            st.video(dub_raw)
+        else:
+            st.audio(dub_raw)
+
+        if st.button("🎬 日本語吹き替えを生成", type="primary", key="dub_run"):
+            aai_key = get_aai_key()
+            client = get_llm_client(backend_name)
+            model = get_llm_model(backend_name)
+
+            dub_audio_bytes = dub_raw
+            if dub_is_video:
+                with st.spinner("動画から音声を抽出中..."):
+                    dub_audio_bytes = extract_audio_from_video(dub_raw, suffix=f".{dub_ext}")
+
+            with st.spinner("① 全文を文字起こし中..."):
+                try:
+                    audio_url = aai_upload(aai_key, dub_audio_bytes)
+                    data = aai_transcribe(aai_key, audio_url, dub_lang)
+                    full_text = data.get("text", "") or ""
+                except Exception as e:
+                    st.error(f"文字起こし失敗: {e}")
+                    full_text = ""
+
+            if not full_text.strip():
+                st.error("文字起こし結果が空でした。音声を確認してください。")
+            else:
+                st.success(f"文字起こし完了（{len(full_text)}文字）。")
+
+                with st.spinner("② 全文を日本語に翻訳中..."):
+                    tr_progress = st.progress(0.0, text="翻訳中...")
+                    ja_text = translate_long_text(
+                        client, model, full_text, "ja",
+                        progress_cb=lambda r: tr_progress.progress(
+                            r, text=f"翻訳中... {int(r*100)}%"))
+                    tr_progress.empty()
+
+                if not ja_text.strip():
+                    st.error("翻訳に失敗しました。")
+                else:
+                    with st.spinner("③ 日本語音声を生成中..."):
+                        tts_progress = st.progress(0.0, text="音声生成中...")
+                        dub_mp3 = synthesize_long_speech(
+                            ja_text, lang="ja",
+                            progress_cb=lambda r: tts_progress.progress(
+                                r, text=f"音声生成中... {int(r*100)}%"))
+                        tts_progress.empty()
+
+                    dub_video_bytes = None
+                    if dub_mp3 and dub_is_video:
+                        with st.spinner("④ 動画の音声を差し替え中..."):
+                            try:
+                                dub_video_bytes = mux_video_with_audio(
+                                    dub_raw, dub_mp3, suffix=f".{dub_ext}")
+                            except Exception as e:
+                                st.warning(f"動画生成に失敗しました（音声は生成済み）: {e}")
+
+                    ss.dub_result = {
+                        "name": os.path.splitext(dub_uploaded.name)[0],
+                        "en_text": full_text,
+                        "ja_text": ja_text,
+                        "mp3": dub_mp3,
+                        "video": dub_video_bytes,
+                    }
+                    st.success("完了しました！")
+
+    if ss.get("dub_result"):
+        r = ss.dub_result
+        st.divider()
+        st.subheader("📝 日本語訳（全文）")
+        with st.expander("翻訳テキストを表示", expanded=False):
+            st.text_area("日本語訳", r["ja_text"], height=300, key="dub_ja_text_area")
+
+        if r["mp3"]:
+            st.subheader("🔊 日本語音声")
+            st.audio(r["mp3"], format="audio/mp3")
+            st.download_button(
+                "日本語音声 .mp3 をダウンロード", r["mp3"],
+                file_name=f"{r['name']}_日本語吹き替え.mp3", mime="audio/mp3")
+        else:
+            st.warning("音声生成に失敗しました（gTTS未導入の可能性）。")
+
+        if r["video"]:
+            st.subheader("🎬 日本語吹き替え動画")
+            st.video(r["video"])
+            st.download_button(
+                "吹き替え動画 .mp4 をダウンロード", r["video"],
+                file_name=f"{r['name']}_日本語吹き替え.mp4", mime="video/mp4")
+
+        st.download_button(
+            "日本語訳 .txt をダウンロード", r["ja_text"].encode("utf-8"),
+            file_name=f"{r['name']}_日本語訳.txt", mime="text/plain")
 
 with tab_live:
     st.caption("翻訳せず、話した言葉をそのまま数秒遅れで文字表示します（実験機能）。")
