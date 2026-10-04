@@ -1314,23 +1314,59 @@ with tab_dub:
         icon="ℹ️",
     )
 
-    dub_uploaded = st.file_uploader(
-        "英語などの音声・動画ファイルをアップロード",
-        type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"]
-        + VIDEO_EXTS,
-        key="dub_uploader",
+    dub_source = st.radio(
+        "入力方法",
+        ["📁 ファイルをアップロード", "🎤 マイクで録音"],
+        horizontal=True, key="dub_source",
+        help="マイク録音は、話し終えて「録音停止」を押した後に"
+             "まとめて文字起こし→翻訳→日本語音声化します（リアルタイム同期なし）。",
     )
     dub_lang = st.selectbox(
         "元の音声の言語", options=[("英語", "en"), ("自動判定", ""), ("日本語", "ja")],
         format_func=lambda x: x[0], key="dub_src_lang")[1]
 
     ss.setdefault("dub_result", None)
+    ss.setdefault("dub_recorded_audio", None)
 
-    if dub_uploaded is not None:
-        dub_raw = dub_uploaded.getvalue()
-        dub_ext = os.path.splitext(dub_uploaded.name)[1].lower().lstrip(".")
-        dub_is_video = dub_ext in VIDEO_EXTS
-        st.info(f"ファイル: {dub_uploaded.name} / {len(dub_raw)/1024/1024:.1f} MB"
+    dub_raw = None
+    dub_name = "講演"
+    dub_ext = "wav"
+    dub_is_video = False
+
+    if dub_source.startswith("📁"):
+        dub_uploaded = st.file_uploader(
+            "英語などの音声・動画ファイルをアップロード",
+            type=["m4a", "mp3", "wav", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"]
+            + VIDEO_EXTS,
+            key="dub_uploader",
+        )
+        if dub_uploaded is not None:
+            dub_raw = dub_uploaded.getvalue()
+            dub_name = dub_uploaded.name
+            dub_ext = os.path.splitext(dub_uploaded.name)[1].lower().lstrip(".")
+            dub_is_video = dub_ext in VIDEO_EXTS
+    else:
+        st.caption("「録音開始」を押して講演を録音し、終わったら「録音停止」を押してください。"
+                   "長時間の講演も録音できますが、停止するまで処理は始まりません。")
+        dub_recorded = mic_recorder(
+            start_prompt="🎤 録音開始", stop_prompt="⏹ 録音停止",
+            just_once=False, use_container_width=True, key="dub_mic_recorder",
+        )
+        if dub_recorded:
+            ss.dub_recorded_audio = dub_recorded["bytes"]
+        if ss.dub_recorded_audio:
+            dur = get_audio_duration(ss.dub_recorded_audio)
+            st.success(f"録音完了 / 録音時間 {fmt_duration_ja(dur)}" if dur else "録音完了")
+            if st.button("録音をクリア", key="dub_clear_rec"):
+                ss.dub_recorded_audio = None
+                st.rerun()
+            dub_raw = ss.dub_recorded_audio
+            dub_name = "講演録音"
+            dub_ext = "wav"
+            dub_is_video = False
+
+    if dub_raw is not None:
+        st.info(f"音声データ: {len(dub_raw)/1024/1024:.1f} MB"
                + ("（動画）" if dub_is_video else ""))
         if dub_is_video:
             st.video(dub_raw)
@@ -1390,7 +1426,7 @@ with tab_dub:
                                 st.warning(f"動画生成に失敗しました（音声は生成済み）: {e}")
 
                     ss.dub_result = {
-                        "name": os.path.splitext(dub_uploaded.name)[0],
+                        "name": os.path.splitext(dub_name)[0],
                         "en_text": full_text,
                         "ja_text": ja_text,
                         "mp3": dub_mp3,
