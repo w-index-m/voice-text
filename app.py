@@ -1085,8 +1085,8 @@ ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
 ss.setdefault("sentiment", None)
 
-tab_rec, tab_up, tab_rt, tab_vo = st.tabs(
-    ["🎤 マイク録音", "📁 ファイルアップロード",
+tab_rec, tab_up, tab_live, tab_rt, tab_vo = st.tabs(
+    ["🎤 マイク録音", "📁 ファイルアップロード", "📝 ライブ文字起こし(実験)",
      "🌐 リアルタイム翻訳(実験)", "🔊 音声通訳 日英(実験)"])
 
 file_bytes = None
@@ -1195,6 +1195,92 @@ with tab_up:
             file_bytes = raw_bytes
             st.audio(file_bytes)
             render_waveform(file_bytes, audio_name)
+
+with tab_live:
+    st.caption("翻訳せず、話した言葉をそのまま数秒遅れで文字表示します（実験機能）。")
+    if not WEBRTC_AVAILABLE:
+        st.warning("この機能には streamlit-webrtc が必要です。requirements.txt に追加済みなので"
+                   "デプロイ後に利用できます。")
+    else:
+        live_groq_ready = get_groq_client() is not None
+        live_engine_opts = ["AssemblyAI（単一言語・高精度）"]
+        if live_groq_ready:
+            live_engine_opts.insert(0, "Whisper via Groq（多言語混在対応）")
+        live_engine = st.radio(
+            "文字起こしエンジン", live_engine_opts, key="live_engine",
+            help="複数言語が混じる音声はWhisperが比較的得意です（GROQ_API_KEYが必要）。",
+        )
+        live_use_whisper = live_engine.startswith("Whisper")
+        if not live_groq_ready:
+            st.caption("Whisper（多言語混在対応）を使うには GROQ_API_KEY をSecretに追加してください。")
+
+        if not live_use_whisper:
+            live_lang = st.selectbox(
+                "話す言語",
+                options=[("日本語", "ja"), ("英語", "en"), ("自動判定", "")],
+                format_func=lambda x: x[0], key="live_lang")[1]
+        else:
+            live_lang = ""  # Whisperは自動判定
+            st.caption("Whisperは言語を自動判定します（複数言語の混在も可）。")
+        st.caption("「START」を押してマイクを許可 → 話す。止めるには「STOP」。")
+
+        ss.setdefault("live_log", [])
+        if st.button("🗑 表示をクリア", key="live_clear"):
+            ss.live_log = []
+
+        live_ctx = webrtc_streamer(
+            key="live-transcribe",
+            mode=WebRtcMode.SENDONLY,
+            audio_receiver_size=2048,
+            media_stream_constraints={"audio": True, "video": False},
+            rtc_configuration=RTC_ICE_CONFIG,
+        )
+
+        live_box = st.empty()
+        if ss.live_log:
+            live_box.markdown("### 📝 文字起こし\n\n" + " ".join(ss.live_log))
+
+        if live_ctx.state.playing:
+            live_aai_key = get_aai_key()
+            live_groq_client = get_groq_client() if live_use_whisper else None
+            live_status = st.empty()
+            live_chunk_seconds = 3
+            live_frame_buffer: list = []
+
+            while True:
+                if live_ctx.audio_receiver:
+                    try:
+                        frames = live_ctx.audio_receiver.get_frames(timeout=1)
+                    except queue.Empty:
+                        frames = []
+                else:
+                    break
+
+                live_frame_buffer.extend(frames)
+                total = sum(f.samples for f in live_frame_buffer) if live_frame_buffer else 0
+                rate = live_frame_buffer[0].sample_rate if live_frame_buffer else 48000
+                dur = total / rate if rate else 0
+
+                if dur >= live_chunk_seconds:
+                    live_status.caption("📝 認識中...")
+                    wav = frames_to_wav_bytes(live_frame_buffer)
+                    live_frame_buffer = []
+                    if wav:
+                        try:
+                            if live_use_whisper and live_groq_client is not None:
+                                src = whisper_transcribe_bytes(live_groq_client, wav)
+                            else:
+                                url = aai_upload(live_aai_key, wav)
+                                src = aai_transcribe_quick(live_aai_key, url, live_lang or "ja")
+                            if src.strip() and not is_noise_text(src):
+                                ss.live_log.append(src.strip())
+                                live_box.markdown(
+                                    "### 📝 文字起こし\n\n" + " ".join(ss.live_log))
+                        except Exception as e:
+                            live_status.caption(f"変換エラー: {e}")
+                    live_status.caption("🎤 録音中...")
+        else:
+            st.info("STARTを押すと文字起こしが始まります。ページを開いたままにしてください。")
 
 with tab_rt:
     st.caption("話しながら数秒遅れで翻訳して表示します（日本語⇄英語など・実験機能）。")
