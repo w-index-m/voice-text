@@ -497,6 +497,101 @@ def compute_speaker_talk_time(data: dict, name_map: dict | None = None) -> list[
     return rows
 
 
+def compute_speaker_speech_style(data: dict, audio_bytes: bytes,
+                                 name_map: dict | None = None,
+                                 max_utterances_per_speaker: int = 20) -> list[dict]:
+    """話者ごとの話し方の特徴（話速・ポーズ比率・ピッチ変動）を音響分析で集計する。
+    心理的な「自信度」の断定はせず、客観的な音響指標と相対的な傾向ラベルのみ返す。
+    処理コストを抑えるため、話者ごとに発言時間の長い順で最大max_utterances_per_speaker件のみ分析。"""
+    if not LIBROSA_AVAILABLE:
+        return []
+    utterances = data.get("utterances") or []
+    if not utterances:
+        return []
+    name_map = name_map or {}
+
+    try:
+        y, sr = librosa.load(io.BytesIO(audio_bytes), sr=None, mono=True)
+    except Exception:
+        return []
+    if sr <= 0 or len(y) == 0:
+        return []
+
+    # 話者ごとに発言を集め、長い順に上限件数へ絞る（処理時間の抑制）
+    by_speaker: dict[str, list[dict]] = {}
+    for u in utterances:
+        by_speaker.setdefault(u["speaker"], []).append(u)
+    for label in by_speaker:
+        by_speaker[label].sort(key=lambda u: -(u.get("end", 0) - u.get("start", 0)))
+        by_speaker[label] = by_speaker[label][:max_utterances_per_speaker]
+
+    speaker_metrics: dict[str, dict] = {}
+    for label, utts in by_speaker.items():
+        rates, pause_ratios, pitch_stds = [], [], []
+        for u in utts:
+            start_ms, end_ms = u.get("start", 0), u.get("end", 0)
+            dur = (end_ms - start_ms) / 1000.0
+            text = u.get("text", "")
+            if dur <= 0.3 or not text.strip():
+                continue
+            s0, s1 = int(start_ms / 1000 * sr), int(end_ms / 1000 * sr)
+            seg = y[max(0, s0):min(len(y), s1)]
+            if len(seg) < sr * 0.3:
+                continue
+            rates.append(len(text) / dur)
+            try:
+                intervals = librosa.effects.split(seg, top_db=30)
+                non_silent = sum((i1 - i0) for i0, i1 in intervals) / sr
+                pause_ratios.append(max(0.0, min(1.0, 1 - non_silent / dur)))
+            except Exception:
+                pass
+            try:
+                f0 = librosa.yin(seg, fmin=65, fmax=400, sr=sr)
+                f0_valid = f0[(f0 > 65) & (f0 < 400)]
+                if len(f0_valid) >= 5:
+                    pitch_stds.append(float(np.std(f0_valid)))
+            except Exception:
+                pass
+        if rates:
+            speaker_metrics[label] = {
+                "rate": sum(rates) / len(rates),
+                "pause": sum(pause_ratios) / len(pause_ratios) if pause_ratios else None,
+                "pitch": sum(pitch_stds) / len(pitch_stds) if pitch_stds else None,
+            }
+
+    if not speaker_metrics:
+        return []
+
+    # 相対比較用の全体平均
+    all_rates = [m["rate"] for m in speaker_metrics.values()]
+    all_pauses = [m["pause"] for m in speaker_metrics.values() if m["pause"] is not None]
+    avg_rate = sum(all_rates) / len(all_rates)
+    avg_pause = sum(all_pauses) / len(all_pauses) if all_pauses else None
+
+    rows = []
+    for label, m in speaker_metrics.items():
+        display = name_map.get(label) or f"話者{label}"
+        tags = []
+        if m["pause"] is not None and avg_pause is not None:
+            if m["pause"] > avg_pause * 1.3:
+                tags.append("間（ま）が多め")
+            elif m["pause"] < avg_pause * 0.7:
+                tags.append("間が少なく淀みにくい")
+        if m["rate"] < avg_rate * 0.8:
+            tags.append("ゆっくり・慎重")
+        elif m["rate"] > avg_rate * 1.2:
+            tags.append("早口")
+        rows.append({
+            "話者": display,
+            "平均話速(文字/秒)": round(m["rate"], 1),
+            "ポーズ比率(%)": round(m["pause"] * 100, 1) if m["pause"] is not None else None,
+            "ピッチ変動(Hz)": round(m["pitch"], 1) if m["pitch"] is not None else None,
+            "傾向": " / ".join(tags) if tags else "標準的",
+        })
+    rows.sort(key=lambda r: -(r["ポーズ比率(%)"] or 0))
+    return rows
+
+
 # ----- リアルタイム翻訳（実験）用ヘルパー -----
 def frames_to_wav_bytes(frames: list, target_rate: int = 16000) -> bytes | None:
     """streamlit-webrtc の音声フレーム列を16kHzモノラル16bit WAVに変換する。
@@ -1191,6 +1286,7 @@ ss.setdefault("recorded_audio", None)
 ss.setdefault("minutes_edited", None)
 ss.setdefault("audio_duration", None)
 ss.setdefault("sentiment", None)
+ss.setdefault("speech_style_rows", None)
 
 tab_rec, tab_up, tab_dub, tab_live, tab_rt, tab_vo = st.tabs(
     ["🎤 マイク録音", "📁 ファイルアップロード", "🎬 日本語吹き替え生成(実験)",
@@ -1834,6 +1930,7 @@ if file_bytes is not None:
             st.stop()
         save_transcript_cache(data, audio_name)
         ss.minutes_edited = None
+        ss["speech_style_rows"] = None
         st.success(f"完了。検出話者: {len(ss.speakers)}名 / Transcript ID: `{data.get('id')}`")
         st.caption("※ このIDをサイドバーに入力すると次回リロード後も結果を復元できます。")
 
@@ -1917,6 +2014,32 @@ if ss.aai_data is not None:
             st.pyplot(fig, use_container_width=True)
             plt.close(fig)
             st.dataframe(talk_time, use_container_width=True, hide_index=True)
+
+    with st.expander("🗣 話し方の傾向（音響分析・実験的機能）", expanded=False):
+        st.caption(
+            "話速・間（ま）の比率・声の抑揚（ピッチ変動）を音響的に解析します。"
+            "心理状態や理解度を断定するものではなく、客観的な指標と相対的な傾向ラベルです。"
+            "音声が長いと処理に時間がかかります。"
+        )
+        if not LIBROSA_AVAILABLE:
+            st.caption("この機能には librosa が必要です。")
+        elif st.button("🗣 話し方を分析", key="analyze_speech_style"):
+            if file_bytes is None:
+                st.warning("音声データが見つかりません。録音/アップロードをやり直してください。")
+            else:
+                with st.spinner("音響特徴を分析中...（発言が多いと数十秒かかります）"):
+                    ss["speech_style_rows"] = compute_speaker_speech_style(
+                        ss.aai_data, file_bytes, name_map)
+
+        style_rows = ss.get("speech_style_rows")
+        if style_rows:
+            st.dataframe(style_rows, use_container_width=True, hide_index=True)
+            st.caption(
+                "※ ポーズ比率が高い/話速が遅い＝自信がない、とは限りません。"
+                "あくまで話し方の特徴の目安としてご利用ください。"
+            )
+        elif style_rows is not None:
+            st.caption("分析できる発言がありませんでした。")
 
     if show_transcript:
         with st.expander("話者分離テキスト全文", expanded=False):
