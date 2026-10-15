@@ -1911,6 +1911,7 @@ if file_bytes is not None:
 
     if st.button("① 文字起こし（話者分離）", type="primary"):
         aai_key = get_aai_key()
+        process_start = time.time()
         upload_bytes = file_bytes
         if use_noise_reduction and NOISEREDUCE_AVAILABLE:
             with st.spinner("ノイズ除去中..."):
@@ -1928,11 +1929,23 @@ if file_bytes is not None:
         except Exception as e:
             st.error(f"文字起こし失敗: {e}")
             st.stop()
+        elapsed = time.time() - process_start
         save_transcript_cache(data, audio_name)
         ss.minutes_edited = None
         ss["speech_style_rows"] = None
         st.success(f"完了。検出話者: {len(ss.speakers)}名 / Transcript ID: `{data.get('id')}`")
         st.caption("※ このIDをサイドバーに入力すると次回リロード後も結果を復元できます。")
+
+        # RTF (Real-Time Factor) = 処理時間 ÷ 音声長。値が小さいほど音声長に対して高速。
+        audio_dur = get_audio_duration(upload_bytes) or ss.get("audio_duration")
+        if audio_dur:
+            rtf = elapsed / audio_dur
+            st.caption(
+                f"⏱ 処理時間: {fmt_duration_ja(elapsed)}"
+                f" / 音声長: {fmt_duration_ja(audio_dur)}"
+                f" / RTF: {rtf:.2f}"
+                f"（RTF<1で音声の実時間より速く処理。小さいほど高速）"
+            )
 
 # ステップ2: リネーム & 議事録
 if ss.aai_data is not None:
