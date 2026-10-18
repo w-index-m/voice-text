@@ -996,6 +996,12 @@ GRANULARITY_SPEC = {
     "決定事項のみ": "決定事項と次アクションだけを抽出。雑談や経緯は省く。",
 }
 
+SEMINAR_GRANULARITY_SPEC = {
+    "3行サマリ": "セミナー全体の要点を3行程度で簡潔にまとめる。詳細は省く。",
+    "詳細まとめ": "テーマ・要点・インサイト・Q&Aまで網羅した詳細なまとめ。",
+    "重要ポイントのみ": "最も重要な主張・学び・数字だけを抽出。前置きや雑談は省く。",
+}
+
 
 def summarize(client: OpenAI, model: str, diarized_text: str,
               meeting_title: str, meeting_date: str,
@@ -1023,6 +1029,53 @@ def summarize(client: OpenAI, model: str, diarized_text: str,
 - ## 議論の要点
 - ## 決定事項
 - ## ToDo（担当者・期限が分かれば併記）
+
+---
+文字起こし（話者分離済み）:
+{diarized_text}
+"""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system},
+                  {"role": "user", "content": user}],
+        max_tokens=4000,
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content
+
+
+def summarize_seminar(client: OpenAI, model: str, diarized_text: str,
+                      seminar_title: str, seminar_date: str,
+                      speakers_hint: str, granularity: str) -> str:
+    """セミナー・講演向けのまとめを作成する。決定事項/ToDoではなく、
+    テーマ・要点・インサイト・Q&Aを中心に構造化する。"""
+    system = (
+        "あなたは優秀なセミナー・講演レポーターです。話者ラベル付きの文字起こしを読み、"
+        "聴講者が後から読み返して内容を理解・活用できるよう、日本語で構造化されたまとめを"
+        "Markdown で作成してください。会議の決定事項やToDoではなく、"
+        "講演内容の理解・要点整理・学びを重視してください。"
+    )
+    spec = SEMINAR_GRANULARITY_SPEC.get(
+        granularity, SEMINAR_GRANULARITY_SPEC["詳細まとめ"])
+    user = f"""以下はセミナー・講演の文字起こしです。各行が「話者: 発言」の形式です。
+話者は登壇者（講演者）や質疑応答の質問者です。
+
+# 粒度の指示
+{spec}
+
+# メタ情報
+セミナー名/テーマ: {seminar_title or "（不明）"}
+日時: {seminar_date or "（不明）"}
+登壇者（事前入力）: {speakers_hint or "（未入力）"}
+
+# 出力フォーマット（粒度に応じて不要な節は省略可）
+- ## セミナー名 / 日時
+- ## 登壇者
+- ## 概要（何についての話か・一言で）
+- ## 要点（セクション・トピックごとに箇条書き）
+- ## 重要なインサイト・引用（印象的な発言や数字があれば引用）
+- ## Q&A（質疑応答があれば質問と回答の要約）
+- ## 学び・次に活かせるアクション
 
 ---
 文字起こし（話者分離済み）:
@@ -1200,25 +1253,35 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("会議情報")
-    meeting_title = st.text_input("会議名（任意）")
+    doc_type = st.radio(
+        "文書の種類", ["会議", "セミナー・講演"], horizontal=True, key="doc_type",
+        help="「セミナー・講演」は決定事項/ToDoではなく、"
+             "テーマ・要点・インサイト・Q&A中心のまとめを作成します。",
+    )
+    is_seminar = doc_type == "セミナー・講演"
+
+    st.header("セミナー情報" if is_seminar else "会議情報")
+    meeting_title = st.text_input("セミナー名（任意）" if is_seminar else "会議名（任意）")
     meeting_date = st.text_input("日時（任意・例: 2026-06-27 14:00）")
-    attendees = st.text_area("出席者（任意・改行 or カンマ区切り）",
-                             help="入力しておくと話者の実名を自動推定できます。")
+    attendees = st.text_area(
+        "登壇者（任意・改行 or カンマ区切り）" if is_seminar else "出席者（任意・改行 or カンマ区切り）",
+        help="入力しておくと話者の実名を自動推定できます。")
     language = st.selectbox("音声の言語",
                             options=[("日本語", "ja"), ("英語", "en"), ("自動判定", "")],
                             format_func=lambda x: x[0])[1]
     output_mode = st.radio(
         "出力タイプ",
-        ["議事録（要約・構造化）", "聞いたままの再現（逐語）"],
-        help="「議事録」は要点をまとめて構造化。「聞いたまま」は要約せず発言を忠実に再現します。",
+        ["まとめ（要約・構造化）" if is_seminar else "議事録（要約・構造化）",
+         "聞いたままの再現（逐語）"],
+        help="「まとめ/議事録」は要点をまとめて構造化。「聞いたまま」は要約せず発言を忠実に再現します。",
     )
     is_verbatim = output_mode.startswith("聞いたまま")
     verbatim_translate_ja = False
+    current_granularity_spec = SEMINAR_GRANULARITY_SPEC if is_seminar else GRANULARITY_SPEC
     if not is_verbatim:
-        granularity = st.radio("要約の粒度", list(GRANULARITY_SPEC.keys()), index=1)
+        granularity = st.radio("要約の粒度", list(current_granularity_spec.keys()), index=1)
     else:
-        granularity = "詳細議事録"  # 逐語モードでは未使用
+        granularity = next(iter(current_granularity_spec))  # 逐語モードでは未使用
         verbatim_lang = st.radio(
             "逐語の言語",
             ["原文のまま", "日本語に翻訳"],
@@ -2058,18 +2121,21 @@ if ss.aai_data is not None:
         with st.expander("話者分離テキスト全文", expanded=False):
             st.text_area("transcript", diarized, height=300)
 
-    gen_label = "③ 逐語再現を作成" if is_verbatim else "③ 議事録を作成"
+    gen_label = "③ 逐語再現を作成" if is_verbatim else ("③ まとめを作成" if is_seminar else "③ 議事録を作成")
     if st.button(gen_label, type="primary"):
         client = get_llm_client(backend_name)
         model = get_llm_model(backend_name)
 
-        spin_label = "聞いたまま再現中" if is_verbatim else "議事録を整形中"
+        spin_label = "聞いたまま再現中" if is_verbatim else "まとめを整形中" if is_seminar else "議事録を整形中"
         with st.spinner(f"{spin_label}...（{backend_name}）"):
             try:
                 if is_verbatim:
                     minutes = reproduce_verbatim(client, model, diarized,
                                                  meeting_title, meeting_date,
                                                  translate_ja=verbatim_translate_ja)
+                elif is_seminar:
+                    minutes = summarize_seminar(client, model, diarized, meeting_title,
+                                                meeting_date, attendees, granularity)
                 else:
                     minutes = summarize(client, model, diarized, meeting_title,
                                         meeting_date, attendees, granularity)
@@ -2077,8 +2143,8 @@ if ss.aai_data is not None:
                 st.error(f"生成に失敗しました: {e}")
                 st.stop()
 
-        # ToDo抽出は議事録モードのみ
-        if is_verbatim:
+        # ToDo抽出は会議の議事録モードのみ（セミナーは決定事項/ToDoの概念が薄いため省略）
+        if is_verbatim or is_seminar:
             todos = []
         else:
             with st.spinner("ToDoを抽出中..."):
@@ -2091,7 +2157,8 @@ if ss.aai_data is not None:
 
     # 議事録表示＆編集
     if ss.get("minutes_edited") is not None:
-        out_heading = "📝 逐語再現（聞いたまま）" if is_verbatim else "📝 議事録"
+        out_heading = ("📝 逐語再現（聞いたまま）" if is_verbatim
+                      else "📝 セミナーまとめ" if is_seminar else "📝 議事録")
         st.subheader(out_heading)
 
         tab_preview, tab_edit = st.tabs(["プレビュー", "✏️ 編集"])
@@ -2140,7 +2207,7 @@ if ss.aai_data is not None:
         if todos:
             st.subheader("✅ ToDo")
             st.dataframe(todos, use_container_width=True)
-        elif not is_verbatim:
+        elif not is_verbatim and not is_seminar:
             st.caption("抽出されたToDoはありませんでした。")
 
         # 感情・温度感レポート
@@ -2162,8 +2229,9 @@ if ss.aai_data is not None:
         base = os.path.splitext(ss.audio_name)[0]
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            dl_label = "逐語 .md" if is_verbatim else "議事録 .md"
-            dl_name = f"{base}_逐語.md" if is_verbatim else f"{base}_議事録.md"
+            dl_label = "逐語 .md" if is_verbatim else "まとめ .md" if is_seminar else "議事録 .md"
+            dl_name = (f"{base}_逐語.md" if is_verbatim
+                      else f"{base}_セミナーまとめ.md" if is_seminar else f"{base}_議事録.md")
             st.download_button(dl_label, ss.minutes_edited.encode("utf-8"),
                                file_name=dl_name, mime="text/markdown")
         with c2:
